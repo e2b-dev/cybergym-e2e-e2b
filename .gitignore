@@ -1,0 +1,53 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.e2b/
+e2b.toml
+
+# Python environments and caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Packaging, builds, and coverage
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated benchmark output and runtime state
+artifacts/
+results/
+outputs/
+trajectories/
+logs/
+*.log
+*.pid
+*.pid.lock
+
+# Downloaded, gated, vendored, and local-only assets
+downloads/
+vendor/
+benchmark-data/
+local-assets/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
