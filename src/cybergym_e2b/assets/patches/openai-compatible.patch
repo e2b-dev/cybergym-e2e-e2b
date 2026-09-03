@@ -1,0 +1,47 @@
+diff --git a/scripts/run_agent.py b/scripts/run_agent.py
+index bb67950..aae4d4f 100644
+--- a/scripts/run_agent.py
++++ b/scripts/run_agent.py
+@@ -636,0 +637 @@ supports_websockets = false
++wire_api = "responses"
+@@ -788,0 +790,6 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
++        e2b_ca_bundle = os.environ.get("E2B_CA_BUNDLE")
++        if e2b_ca_bundle:
++            copy_to_container(
++                container_id, Path(e2b_ca_bundle), "/etc/ssl/certs/ca-certificates.crt"
++            )
++
+@@ -1049 +1056 @@ Examples:
+-    parser.add_argument("--model-provider", choices=["litellm", "bedrock", "anthropic"], default="anthropic",
++    parser.add_argument("--model-provider", choices=["litellm", "bedrock", "anthropic", "openai-compatible"], default="anthropic",
+diff --git a/scripts/utils.py b/scripts/utils.py
+index f8b8b82..54ae678 100644
+--- a/scripts/utils.py
++++ b/scripts/utils.py
+@@ -179 +179 @@ def setup_workspace(container_id, data_path, script_path, mode="e2e", copy_gt_po
+-        "apt-get update -qq && apt-get install -y -qq sudo git >/dev/null 2>&1",
++        "grep -rLiE 'archive.ubuntu.com|security.ubuntu.com|ports.ubuntu.com|old-releases.ubuntu.com|deb.debian.org|security.debian.org' /etc/apt/sources.list.d/ 2>/dev/null | xargs -r -I{} mv {} /tmp/ 2>/dev/null; sed -ri '/apt.kitware.com|bazel-apt|apt.llvm.org|packages.cloud.google.com|storage.googleapis.com|download.docker.com|dl.yarnpkg.com|deb.nodesource.com|ppa.launchpad|nginx.org|packagecloud.io|cran.r-project|pgdg/d' /etc/apt/sources.list 2>/dev/null; find /etc/apt/sources.list.d -type f -exec sed -ri '/apt.kitware.com|bazel-apt|apt.llvm.org|packages.cloud.google.com|storage.googleapis.com|download.docker.com|dl.yarnpkg.com|nginx.org|packagecloud.io|cran.r-project|pgdg/d' {} + 2>/dev/null; apt-get update -qq && apt-get install -y -qq sudo git >/dev/null 2>&1",
+@@ -198,0 +199,9 @@ def setup_workspace(container_id, data_path, script_path, mode="e2e", copy_gt_po
++    # The Opus model host offers an rsync mirror but its HTTPS endpoint is
++    # intermittently unavailable. Hot E2B templates carry the checksum-pinned
++    # archive so FFmpeg setup remains reproducible under restricted egress.
++    opus_model_cache = os.getenv("E2B_OPUS_MODEL_CACHE")
++    if opus_model_cache and Path(opus_model_cache).is_file() and subprocess.run(
++        ["docker", "exec", container_id, "test", "-d", "/src/opus"]
++    ).returncode == 0:
++        copy_to_container(container_id, opus_model_cache, f"/src/opus/{Path(opus_model_cache).name}")
++
+@@ -385,0 +395,5 @@ def get_llm_env(
++        # OpenAI-compatible catalog IDs are absent from LiteLLM's static metadata.
++        # Pin conservative limits so OpenHands does not assume a 4K context window.
++        "LLM_MAX_INPUT_TOKENS": "131072",
++        "LLM_MAX_OUTPUT_TOKENS": "8192",
++        "LLM_NATIVE_TOOL_CALLING": "true",
+@@ -387,0 +402,7 @@ def get_llm_env(
++    if os.getenv("E2B_CA_BUNDLE"):
++        base_env.update({
++            "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
++            "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
++            "NODE_EXTRA_CA_CERTS": "/etc/ssl/certs/ca-certificates.crt",
++        })
++

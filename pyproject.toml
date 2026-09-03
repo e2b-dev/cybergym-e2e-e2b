@@ -1,0 +1,60 @@
+[project]
+name = "cybergym-e2e-e2b"
+version = "0.2.0"
+description = "Run CyberGym-E2E with one Docker-in-Docker E2B sandbox per task"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+  "e2b>=2.37.0,<2.38",
+  "httpx>=0.28,<0.29",
+  "tomli-w>=1.2,<2",
+]
+
+[project.scripts]
+cybergym-e2b = "cybergym_e2b.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/e2b-dev/cybergym-e2e-e2b"
+Issues = "https://github.com/e2b-dev/cybergym-e2e-e2b/issues"
+Source = "https://github.com/e2b-dev/cybergym-e2e-e2b"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "cybergym_e2b"
+source-include = [
+  ".gitignore",
+  ".github/workflows/ci.yml",
+  "LICENSE",
+  "SECURITY.md",
+  "scripts/check_public_tree.py",
+  "tests/**",
+  "uv.lock",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9,<10",
+  "ruff>=0.12,<1",
+  "twine>=6,<7",
+  "uv_build>=0.8.4,<0.9",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+exclude = [".venv", "artifacts", "vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/cybergym_e2b/runtime.py" = ["E501"]
+"src/cybergym_e2b/templates.py" = ["E501"]

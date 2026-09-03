@@ -1,0 +1,628 @@
+from __future__ import annotations
+
+import json
+import tarfile
+from dataclasses import replace
+from io import BytesIO
+from pathlib import Path
+
+from cybergym_e2b.cli import _already_completed, _parser
+from cybergym_e2b.config import (
+    BASE_BUILDER_IMAGES,
+    DEFAULT_MANIFEST,
+    DEFAULT_MODEL,
+    DEFAULT_MODEL_PROVIDER,
+    DEFAULT_NETWORK_POLICY,
+    DEFAULT_PATCH_FILE,
+    DEFAULT_REMOTE_SMOKE,
+    FFMPEG_IMAGE,
+    FFMPEG_IMAGE_DIGEST,
+    TemplateManifest,
+    TemplateRef,
+    normalize_task,
+)
+from cybergym_e2b.inventory import build_code_bundle, inventory, load_image_map, resolve_task
+from cybergym_e2b.runtime import (
+    RunOptions,
+    _agent_model_id,
+    _assert_image_identity,
+    _benchmark_result,
+    _create_fresh_sandbox_from_template,
+    _experiment_identity,
+    _model_config,
+    _network,
+    _policy,
+    _resource_summary,
+    _route_template,
+    _shell_run,
+)
+
+UPSTREAM = Path("vendor/cybergym-e2e")
+
+
+def test_validated_8c8g_configuration_is_the_default() -> None:
+    assert DEFAULT_MANIFEST.parts[-3:] == ("artifacts", "templates", "manifest.json")
+    assert DEFAULT_MODEL == "openai.gpt-5.4"
+    assert DEFAULT_MODEL_PROVIDER == "bedrock"
+    assert not DEFAULT_MANIFEST.exists()
+
+
+def test_default_egress_enforces_the_default_allow_policy() -> None:
+    args = _parser().parse_args(["run", "curl/arvo_66012"])
+    assert args.egress == "policy"
+
+    policy = _policy(DEFAULT_NETWORK_POLICY)
+    assert policy["default_action"] == "allow"
+    assert "169.254.0.0/16" in policy["deny_out"]
+
+
+def test_network_credentials_are_scoped_to_their_phase() -> None:
+    policy = _policy(DEFAULT_NETWORK_POLICY)
+    setup = _network(
+        policy,
+        phase="setup",
+        egress="policy",
+        hf_token="hf-secret",
+        model_key="model-secret",
+        non_http=[],
+    )
+    assert set(setup["rules"]) == {"huggingface.co"}
+    assert set(setup["deny_out"]) == set(policy["deny_out"])
+    assert "allow_out" not in setup
+    runtime = _network(
+        policy,
+        phase="runtime",
+        egress="policy",
+        hf_token="hf-secret",
+        model_key="model-secret",
+        non_http=[],
+    )
+    assert set(runtime["rules"]) == {"api.fireworks.ai"}
+    assert set(runtime["deny_out"]) == set(policy["deny_out"])
+    assert "allow_out" not in runtime
+
+    locked_policy = _policy(DEFAULT_NETWORK_POLICY.with_name("network-locked.json"))
+    locked_runtime = _network(
+        locked_policy,
+        phase="runtime",
+        egress="policy",
+        hf_token="hf-secret",
+        model_key="model-secret",
+        non_http=[],
+    )
+    assert locked_runtime["deny_out"] == ["0.0.0.0/0"]
+    assert locked_runtime["allow_out"] == ["api.fireworks.ai"]
+    assert set(locked_runtime["rules"]) == {"api.fireworks.ai"}
+
+    legacy_restricted = _network(
+        policy,
+        phase="runtime",
+        egress="restricted",
+        hf_token="hf-secret",
+        model_key="model-secret",
+        non_http=[],
+    )
+    assert legacy_restricted["deny_out"] == ["0.0.0.0/0"]
+    assert "api.fireworks.ai" in legacy_restricted["allow_out"]
+
+    bedrock = _network(
+        policy,
+        phase="runtime",
+        egress="policy",
+        hf_token=None,
+        model_key="bedrock-secret",
+        non_http=[],
+        model_host="bedrock-mantle.us-west-2.api.aws",
+    )
+    assert set(bedrock["rules"]) == {"bedrock-mantle.us-west-2.api.aws"}
+
+
+def test_bedrock_provider_uses_mantle_responses_endpoint() -> None:
+    args = _parser().parse_args(
+        [
+            "run",
+            "curl/arvo_66012",
+            "--provider",
+            "bedrock",
+            "--model",
+            "openai.gpt-5.4",
+        ]
+    )
+    options = RunOptions(provider=args.provider, bedrock_region=args.bedrock_region)
+    config = _model_config(options)
+    assert config["host"] == "bedrock-mantle.us-west-2.api.aws"
+    assert config["base_url"] == ("https://bedrock-mantle.us-west-2.api.aws/openai/v1")
+
+
+def test_bedrock_openhands_uses_mantle_chat_completions_endpoint() -> None:
+    options = RunOptions(
+        provider="bedrock",
+        agent="openhands",
+        model="deepseek.v3.2",
+        bedrock_region="us-west-2",
+    )
+    config = _model_config(options)
+    assert config["host"] == "bedrock-mantle.us-west-2.api.aws"
+    assert config["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/v1"
+    assert _agent_model_id(options) == "openai/deepseek.v3.2"
+    assert _agent_model_id(replace(options, agent="codex")) == "deepseek.v3.2"
+
+
+def test_network_policy_rejects_unsupported_deny_cidrs(tmp_path: Path) -> None:
+    raw = json.loads(DEFAULT_NETWORK_POLICY.read_text(encoding="utf-8"))
+    raw["deny_out"] = ["0.0.0.0/8"]
+    path = tmp_path / "network.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    try:
+        _policy(path)
+    except ValueError as exc:
+        assert "not supported by E2B" in str(exc)
+    else:
+        raise AssertionError("an E2B-invalid deny CIDR was accepted")
+
+    raw["deny_out"] = ["240.0.0.0/4"]
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    try:
+        _policy(path)
+    except ValueError as exc:
+        assert "not supported by E2B" in str(exc)
+    else:
+        raise AssertionError("E2B's platform-address range was accepted in deny_out")
+
+
+def test_pinned_inventory_shape() -> None:
+    result = inventory(UPSTREAM)
+    assert result["tasks"] == 920
+    assert result["projects"] == 139
+    assert result["unique_build_images"] == 509
+    assert result["single_use_build_images"] == 487
+    counts = {row["build_image"]: row["task_count"] for row in result["images"]}
+    assert sum(counts[image] for image in BASE_BUILDER_IMAGES) == 344
+    assert counts[FFMPEG_IMAGE] == 10
+
+
+def test_task_resolution_uses_known_ffmpeg_digest_pin() -> None:
+    original = resolve_task(UPSTREAM, "ffmpeg/oss-fuzz_431665305")
+    assert original.build_image == FFMPEG_IMAGE
+    assert original.runtime_image == FFMPEG_IMAGE_DIGEST
+
+
+def test_image_map_accepts_only_digest_locked_values(tmp_path: Path) -> None:
+    digest = FFMPEG_IMAGE_DIGEST.rsplit(":", 1)[1]
+    path = tmp_path / "images.json"
+    path.write_text(
+        json.dumps({"images": {FFMPEG_IMAGE: f"mirror.invalid/cybergym/e2e@sha256:{digest}"}}),
+        encoding="utf-8",
+    )
+    image_map = load_image_map(path)
+    mapped = resolve_task(UPSTREAM, "ffmpeg/oss-fuzz_431665305", image_map=image_map)
+    assert mapped.build_image == FFMPEG_IMAGE
+    assert mapped.runtime_image == f"mirror.invalid/cybergym/e2e@sha256:{digest}"
+
+    path.write_text(
+        json.dumps({"images": {FFMPEG_IMAGE: "mirror.invalid/cybergym/e2e:ffmpeg"}}),
+        encoding="utf-8",
+    )
+    try:
+        load_image_map(path)
+    except ValueError as exc:
+        assert "digest-locked" in str(exc)
+    else:
+        raise AssertionError("a mutable image-map value was accepted")
+
+    path.write_text(
+        json.dumps({"images": {FFMPEG_IMAGE: "mirror.invalid/cybergym/e2e@sha256:" + "b" * 64}}),
+        encoding="utf-8",
+    )
+    try:
+        load_image_map(path)
+    except ValueError as exc:
+        assert "known FFmpeg digest" in str(exc)
+    else:
+        raise AssertionError("an image map changed the pinned FFmpeg image content")
+
+
+def test_bundle_is_task_scoped_and_applies_provider_patch() -> None:
+    resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
+    payload = build_code_bundle(
+        UPSTREAM,
+        resolved,
+        patch_file=DEFAULT_PATCH_FILE,
+        remote_smoke=DEFAULT_REMOTE_SMOKE,
+    )
+    with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as archive:
+        names = set(archive.getnames())
+        run_agent = archive.extractfile("scripts/run_agent.py")
+        assert run_agent is not None
+        source = run_agent.read().decode()
+        utils = archive.extractfile("scripts/utils.py")
+        assert utils is not None
+        utils_source = utils.read().decode()
+    assert "projects/curl/arvo_66012/config.toml" in names
+    assert not any("projects/ffmpeg/" in name for name in names)
+    assert '"openai-compatible"' in source
+    assert 'wire_api = "responses"' in source
+    assert 'os.environ.get("E2B_CA_BUNDLE")' in source
+    assert 'os.getenv("E2B_OPUS_MODEL_CACHE")' in utils_source
+    assert '"LLM_MAX_INPUT_TOKENS": "131072"' in utils_source
+    assert '"LLM_MAX_OUTPUT_TOKENS": "8192"' in utils_source
+    assert '"LLM_NATIVE_TOOL_CALLING": "true"' in utils_source
+
+
+def test_manifest_round_trip_and_routing(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    base = TemplateRef("base", "build-base-1234", "a" * 64, BASE_BUILDER_IMAGES)
+    hot = TemplateRef(
+        "ffmpeg",
+        "build-ffmpeg-1234",
+        "b" * 64,
+        (*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
+    )
+    manifest = TemplateManifest(base=base, hot={FFMPEG_IMAGE: hot})
+    manifest.write(path)
+    loaded = TemplateManifest.load(path)
+    assert loaded.route(FFMPEG_IMAGE).reference == hot.reference
+    assert loaded.route("n132/arvo:1-fix").reference == base.reference
+    raw = json.loads(path.read_text())
+    assert raw["resources"]["disk_limit_gb"] == 120
+
+
+def test_all_ffmpeg_tasks_use_cache_bearing_hot_template() -> None:
+    base = TemplateRef("base", "build-base-1234", "a" * 64, BASE_BUILDER_IMAGES)
+    hot = TemplateRef(
+        "ffmpeg",
+        "build-ffmpeg-1234",
+        "b" * 64,
+        (*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
+    )
+    manifest = TemplateManifest(base=base, hot={FFMPEG_IMAGE: hot})
+
+    assert (
+        _route_template(
+            manifest,
+            project="ffmpeg",
+            build_image="cybergym/e2e:ffmpeg-legacy-task-image",
+        ).reference
+        == hot.reference
+    )
+    assert (
+        _route_template(
+            manifest,
+            project="curl",
+            build_image="gcr.io/oss-fuzz-base/base-builder",
+        ).reference
+        == base.reference
+    )
+
+
+def test_task_path_rejects_traversal() -> None:
+    try:
+        normalize_task("curl/../secret")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("path traversal was accepted")
+
+
+def test_ffmpeg_digest_is_enforced_even_through_a_mirror() -> None:
+    digest = FFMPEG_IMAGE_DIGEST.split("@", 1)[1]
+    _assert_image_identity(
+        FFMPEG_IMAGE_DIGEST,
+        {"repo_digests": [f"mirror.invalid/cybergym/e2e@{digest}"]},
+    )
+    try:
+        _assert_image_identity(
+            FFMPEG_IMAGE_DIGEST,
+            {"repo_digests": ["mirror.invalid/cybergym/e2e@sha256:wrong"]},
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an unexpected FFmpeg digest was accepted")
+
+
+def test_benchmark_result_separates_benchmark_status_from_infrastructure(tmp_path: Path) -> None:
+    summary = tmp_path / "sandbox/agent_output/curl_task/run/summary.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text('{"status":"failed","attempts":[]}\n', encoding="utf-8")
+    assert _benchmark_result(tmp_path, "run") == {
+        "status": "failed",
+        "outcome": "failed",
+        "upstream_status": "failed",
+        "attempts": [],
+    }
+
+    smoke = tmp_path / "sandbox/smoke-result.json"
+    smoke.write_text('{"stage4":"passed","raw_exit_code":1}\n', encoding="utf-8")
+    assert _benchmark_result(tmp_path, "smoke")["status"] == "passed"
+
+
+def test_benchmark_result_rejects_interrupted_codex_failure_but_keeps_validated_success(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "sandbox/agent_output/curl_task/run"
+    summary = run_dir / "summary.json"
+    trajectory = run_dir / "trajectory/attempt_1.log"
+    trajectory.parent.mkdir(parents=True)
+    trajectory.write_text(
+        json.dumps({"type": "turn.failed", "error": {"message": "provider unavailable"}}) + "\n",
+        encoding="utf-8",
+    )
+    summary.write_text(
+        json.dumps({"status": "failed", "agent": "codex", "attempts": []}) + "\n",
+        encoding="utf-8",
+    )
+    interrupted = _benchmark_result(tmp_path, "run")
+    assert interrupted["status"] == "error"
+    assert interrupted["agent_turn"]["status"] == "failed"
+
+    summary.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "agent": "codex",
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "agent_success": True,
+                        "gt_success": True,
+                        "success": True,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    exact = _benchmark_result(tmp_path, "run")
+    assert exact["status"] == "passed"
+    assert exact["outcome"] == "exact_match"
+    assert exact["upstream_status"] == "success"
+
+    summary.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "agent": "codex",
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "agent_success": True,
+                        "gt_success": False,
+                        "success": True,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    other = _benchmark_result(tmp_path, "run")
+    assert other["status"] == "passed"
+    assert other["outcome"] == "valid_other_vulnerability"
+
+
+class _Files:
+    @staticmethod
+    def read(_path: str) -> str:
+        return "\n".join(
+            [
+                '{"disk_total_bytes":1000,"disk_used_bytes":400,"disk_free_bytes":600,'
+                '"memory_total_bytes":800,"memory_available_bytes":500}',
+                '{"disk_total_bytes":1000,"disk_used_bytes":700,"disk_free_bytes":300,'
+                '"memory_total_bytes":800,"memory_available_bytes":200}',
+            ]
+        )
+
+
+class _Sandbox:
+    files = _Files()
+
+
+def test_resource_summary_reports_worst_observation() -> None:
+    assert _resource_summary(_Sandbox()) == {
+        "sample_count": 2,
+        "interval_seconds": 5,
+        "disk_total_bytes": 1000,
+        "peak_disk_used_bytes": 700,
+        "minimum_disk_free_bytes": 300,
+        "memory_total_bytes": 800,
+        "minimum_memory_available_bytes": 200,
+    }
+
+
+class _SwapFiles:
+    @staticmethod
+    def read(_path: str) -> str:
+        return "\n".join(
+            [
+                '{"disk_total_bytes":1000,"disk_used_bytes":400,"disk_free_bytes":600,'
+                '"memory_total_bytes":800,"memory_available_bytes":500,'
+                '"swap_total_bytes":400,"swap_free_bytes":350,"swap_used_bytes":50}',
+                '{"disk_total_bytes":1000,"disk_used_bytes":700,"disk_free_bytes":300,'
+                '"memory_total_bytes":800,"memory_available_bytes":200,'
+                '"swap_total_bytes":400,"swap_free_bytes":100,"swap_used_bytes":300}',
+            ]
+        )
+
+
+class _SwapSandbox:
+    files = _SwapFiles()
+
+
+def test_resource_summary_reports_swap_pressure() -> None:
+    result = _resource_summary(_SwapSandbox())
+    assert result["swap_total_bytes"] == 400
+    assert result["peak_swap_used_bytes"] == 300
+    assert result["minimum_swap_free_bytes"] == 100
+
+
+def test_resume_skips_graded_model_errors_but_retries_smoke_errors(tmp_path: Path) -> None:
+    task_dir = tmp_path / "curl" / "arvo_66012" / "run"
+    task_dir.mkdir(parents=True)
+    result_path = task_dir / "result.json"
+
+    result_path.write_text(
+        json.dumps(
+            {
+                "completed": True,
+                "experiment": {"sha256": "expected"},
+                "benchmark": {
+                    "status": "failed",
+                    "attempts": [
+                        {
+                            "stage1": "error",
+                            "stage2": "skipped",
+                            "stage3": "skipped",
+                            "stage4": "skipped",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _already_completed(tmp_path, "curl/arvo_66012", "expected")
+    assert not _already_completed(tmp_path, "curl/arvo_66012", "different")
+    result_path.write_text(
+        json.dumps(
+            {
+                "completed": True,
+                "experiment": {"sha256": "expected"},
+                "benchmark": {
+                    "status": "failed",
+                    "stages": {"stage4": "error"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not _already_completed(tmp_path, "curl/arvo_66012", "expected")
+
+
+def test_resume_retries_interrupted_codex_turn(tmp_path: Path) -> None:
+    task_dir = tmp_path / "curl" / "arvo_66012" / "run"
+    trajectory = task_dir / "sandbox/agent_output/task/run/trajectory/attempt_1.log"
+    trajectory.parent.mkdir(parents=True)
+    result_path = task_dir / "result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "completed": True,
+                "experiment": {"sha256": "expected"},
+                "benchmark": {"status": "failed", "agent": "codex", "attempts": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    trajectory.write_text(
+        json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {"message": "rate limit exceeded"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert not _already_completed(tmp_path, "curl/arvo_66012", "expected")
+
+    trajectory.write_text(
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _already_completed(tmp_path, "curl/arvo_66012", "expected")
+
+    result_path.write_text(
+        json.dumps(
+            {
+                "completed": True,
+                "experiment": {"sha256": "expected"},
+                "benchmark": {
+                    "status": "passed",
+                    "outcome": "exact_match",
+                    "attempts": [
+                        {
+                            "stage1": "passed",
+                            "stage2": "passed",
+                            "stage3": "passed",
+                            "stage4": "passed",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _already_completed(tmp_path, "curl/arvo_66012", "expected")
+
+
+def test_experiment_identity_changes_with_kind_and_model(tmp_path: Path) -> None:
+    resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
+    manifest_path = tmp_path / "manifest.json"
+    TemplateManifest(
+        base=TemplateRef("base", "build-base-1234", "a" * 64, BASE_BUILDER_IMAGES)
+    ).write(manifest_path)
+    common = {
+        "upstream": UPSTREAM,
+        "manifest_path": manifest_path,
+        "network_policy_path": DEFAULT_NETWORK_POLICY,
+    }
+    run = _experiment_identity(resolved, kind="run", options=RunOptions(), **common)
+    smoke = _experiment_identity(resolved, kind="smoke", options=RunOptions(), **common)
+    other_model = _experiment_identity(
+        resolved,
+        kind="run",
+        options=replace(RunOptions(), model="accounts/fireworks/models/another-model"),
+        **common,
+    )
+    assert len(run["sha256"]) == 64
+    assert run["sha256"] != smoke["sha256"]
+    assert run["sha256"] != other_model["sha256"]
+
+
+def test_fresh_sandbox_creation_uses_template_and_disables_auto_resume(monkeypatch) -> None:
+    captured = {}
+    expected = object()
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr("cybergym_e2b.runtime.Sandbox.create", create)
+    actual = _create_fresh_sandbox_from_template(
+        "template-name:build-id-1234",
+        timeout=60,
+        metadata={"run_id": "run"},
+        network={"allow_public_traffic": False},
+    )
+    assert actual is expected
+    assert captured["template"] == "template-name:build-id-1234"
+    assert captured["lifecycle"] == {"on_timeout": "kill", "auto_resume": False}
+
+
+def test_shell_run_survives_transient_poll_disconnect(monkeypatch) -> None:
+    class Commands:
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def run(self, command: str, *, timeout: int):
+            assert timeout == 30
+            if "nohup bash" in command:
+                return type("Result", (), {"stdout": ""})()
+            self.polls += 1
+            if self.polls == 1:
+                raise ConnectionError("transient TLS EOF")
+            return type("Result", (), {"stdout": "7\n"})()
+
+    sandbox = type("Sandbox", (), {"commands": Commands()})()
+    monkeypatch.setattr("cybergym_e2b.runtime.time.sleep", lambda _seconds: None)
+    assert _shell_run(sandbox, "do-work", timeout=60) == 7
+    assert sandbox.commands.polls == 2
