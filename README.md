@@ -54,12 +54,14 @@ Use `--image-lock PATH` to select another generated lock; `--image-map` remains 
 alias. After Docker pulls or finds an image in the sandbox, the runner verifies that the observed
 repository digests contain the locked digest.
 
-Template aliases are content-addressed. The recipe digest covers the immutable construction
-inputs, upstream revisions, dependency locks, preloaded images, and resource request. The requested
-name is only a readable prefix; the adapter appends the recipe digest. A local atomic build ledger
-at `artifacts/templates/build-ledger.json` reuses a template reference only when the complete recipe
-matches. The generated manifest records immutable E2B build IDs and recipe digests. Losing the
-ledger causes a rebuild attempt, never blind reuse of a stable name.
+Templates use normal E2B aliases with content-addressed tags such as
+`cybergym-e2e-dind:recipe-0123456789abcdef`. The recipe digest covers the immutable construction
+inputs, upstream revisions, dependency locks, preloaded images, and resource request. A local atomic
+build ledger at `artifacts/templates/build-ledger.json` reuses a tagged template only when the
+complete recipe matches. The generated manifest records the stable tag, immutable E2B template ID,
+immutable build ID, and full recipe digest. Preflight and runtime query E2B and reject the manifest
+if its tag no longer points to the recorded build. Losing the ledger causes a rebuild attempt under
+the same recipe tag; it never reuses an unverified moving tag.
 
 Secrets belong in a local `.env` or another file selected with `CYBERGYM_KEYS_FILE` or
 `--keys-file`. `HF_TOKEN` and the model-provider credential are delivered with E2B request
@@ -109,12 +111,15 @@ FFmpeg image and the checksum-verified Opus archive needed during upstream prepa
 
 ## Validate and run
 
-Preflight verifies the upstream checkout, generated template manifest, immutable task image,
-credentials, and gated dataset access:
+Preflight resolves the same model, network policy, project-aware template route, and immutable task
+image as runtime. It verifies the upstream checkout, selected provider credential, E2B tag-to-build
+receipt, and gated dataset access:
 
 ```bash
 uv run cybergym-e2b preflight \
-  --task curl/arvo_66012
+  --task curl/arvo_66012 \
+  --provider bedrock \
+  --model openai.gpt-5.4
 ```
 
 An infrastructure smoke compiles a fresh nested project and runs the upstream ground-truth S4
@@ -145,12 +150,14 @@ uv run cybergym-e2b batch \
   --model openai.gpt-5.4
 ```
 
-The default network policy permits public dependencies while denying private, loopback,
-link-local, carrier-grade NAT, and multicast IPv4 ranges. `--egress restricted` selects a legacy
-allowlist profile. `--egress permissive` is diagnostic and marks the result ineligible for benchmark
-comparison. The package also includes a deny-by-default policy for deployments that preload all
-dependencies; select it explicitly with `--network-policy` after exporting the packaged asset to a
-local file and reviewing it.
+The upstream Docker runner does not disable networking, so the comparison-compatible default keeps
+public egress while denying private, loopback, link-local, carrier-grade NAT, and multicast IPv4
+ranges. CyberGym instructs agents that network use invalidates the result. The adapter therefore
+marks default-policy results `requires_network_audit`; inspect trajectories and network evidence
+before including them in a published comparison. `--egress restricted` uses a public dependency
+allowlist and also requires an audit. `--egress permissive` is diagnostic and is always ineligible.
+The packaged `network-locked.json` policy permits only the selected model endpoint during runtime
+and is eligible without a public-egress audit after all task dependencies have been preloaded.
 
 Runtime assets can be overridden with `--patch-file`, `--remote-smoke`,
 `--remote-install-codex`, and `--network-policy`. Overrides are included in the experiment
@@ -161,7 +168,8 @@ fingerprint.
 For each task, the runner:
 
 1. merges the upstream project and task configuration and resolves an immutable runtime image;
-2. selects the immutable base or FFmpeg template build;
+2. selects the base or FFmpeg recipe tag and verifies it still resolves to the manifest's immutable
+   build receipt;
 3. creates a fresh sandbox with kill-on-timeout and automatic resume disabled;
 4. configures bounded swap, Docker, ASLR, and free-space preflight;
 5. uploads only the upstream scripts, compatibility assets, project configuration, and requested
@@ -177,7 +185,7 @@ describes orchestration and artifact collection. `benchmark.status` is separatel
 another valid vulnerability.
 
 Artifact reuse requires an exact experiment fingerprint covering task kind, agent and model
-configuration, immutable template, immutable runtime image, source and dataset revisions,
+configuration, verified template build receipt, immutable runtime image, source and dataset revisions,
 compatibility assets, network policy, and runtime options. A model failure with a completed agent
 turn is reusable evidence. Infrastructure errors, interrupted turns, mutable identities, and legacy
 results without the current fingerprint are retried or rejected.

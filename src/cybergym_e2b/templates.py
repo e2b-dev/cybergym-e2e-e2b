@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 from dataclasses import asdict
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ from cybergym_e2b.config import (
 )
 
 TEMPLATE_RECIPE_SCHEMA = "cybergym-e2e-template-v1"
-UBUNTU_SNAPSHOT = "https://snapshot.ubuntu.com/ubuntu/20260810T000000Z"
+UBUNTU_SNAPSHOT = "https://snapshot.ubuntu.com/ubuntu/20260831T000000Z"
 DOCKER_SIGNING_MATERIAL_SHA256 = "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
 DOCKER_PACKAGES = (
     "docker-ce=5:27.5.1-1~ubuntu.22.04~jammy",
@@ -112,10 +113,30 @@ def _recipe(kind: str, inputs: dict[str, Any]) -> dict[str, Any]:
     return {**payload, "sha256": _canonical_sha256(payload)}
 
 
-def _content_name(prefix: str, recipe_sha256: str) -> str:
+def _tagged_name(prefix: str, recipe_sha256: str) -> str:
     if not _TEMPLATE_PREFIX.fullmatch(prefix):
         raise ValueError("template name prefix must contain lowercase letters, digits, and hyphens")
-    return f"{prefix[:46].rstrip('-')}-{recipe_sha256[:16]}"
+    return f"{prefix}:recipe-{recipe_sha256[:16]}"
+
+
+@cache
+def verify_template_ref(ref: TemplateRef) -> dict[str, str]:
+    """Verify that a reusable recipe tag still resolves to its recorded build."""
+    tags = Template.get_tags(ref.template_id)
+    for assigned in tags:
+        if assigned.tag != ref.tag:
+            continue
+        if assigned.build_id != ref.build_id:
+            raise RuntimeError(
+                f"template tag {ref.reference} no longer points to recorded build "
+                f"{ref.build_id}; found {assigned.build_id}"
+            )
+        return {
+            "reference": ref.reference,
+            "template_id": ref.template_id,
+            "build_id": ref.build_id,
+        }
+    raise RuntimeError(f"template tag {ref.reference} is not assigned to {ref.template_id}")
 
 
 def _base_commands(requirements_payload: bytes) -> tuple[str, str, str]:
@@ -132,7 +153,7 @@ printf '%s\n' \
   'deb [check-valid-until=no] {UBUNTU_SNAPSHOT} jammy-security main restricted universe multiverse' \
   > /etc/apt/sources.list
 apt-get -o Acquire::Check-Valid-Until=false update
-apt-get install -y {system_packages}
+apt-get install -y --no-install-recommends {system_packages}
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.asc
 echo '{DOCKER_SIGNING_MATERIAL_SHA256}  /tmp/docker.asc' | sha256sum -c -
@@ -141,7 +162,7 @@ rm /tmp/docker.asc
 chmod a+r /etc/apt/keyrings/docker.gpg
 echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable' > /etc/apt/sources.list.d/docker.list
 apt-get -o Acquire::Check-Valid-Until=false update
-apt-get install -y {docker_packages}
+apt-get install -y --no-install-recommends {docker_packages}
 systemctl enable docker.service containerd.service
 apt-get clean
 rm -rf /var/lib/apt/lists/*
@@ -278,10 +299,10 @@ class _BuildLedger:
     def __init__(self, path: Path):
         self.path = path
         if not path.exists():
-            self.payload: dict[str, Any] = {"schema_version": 1, "records": {}}
+            self.payload: dict[str, Any] = {"schema_version": 2, "records": {}}
             return
         self.payload = json.loads(path.read_text(encoding="utf-8"))
-        if self.payload.get("schema_version") != 1 or not isinstance(
+        if self.payload.get("schema_version") != 2 or not isinstance(
             self.payload.get("records"), dict
         ):
             raise ValueError(f"unsupported template build ledger: {path}")
@@ -295,6 +316,8 @@ class _BuildLedger:
             return None
         ref = TemplateRef(
             name=raw["name"],
+            tag=raw["tag"],
+            template_id=raw["template_id"],
             build_id=raw["build_id"],
             recipe_sha256=raw["recipe_sha256"],
             images=tuple(raw.get("images", ())),
@@ -371,7 +394,7 @@ def build_base_template(
         manifest.write(manifest_path)
         return manifest
 
-    template_name = _content_name(name, recipe["sha256"])
+    template_name = _tagged_name(name, recipe["sha256"])
     builder = _pull(_docker_builder(requirements), BASE_BUILDER_IMAGES)
     builder = builder.run_cmd(_BASE_FINALIZE_COMMAND).set_ready_cmd(_READY_COMMAND)
     build = Template.build(
@@ -383,7 +406,9 @@ def build_base_template(
         request_timeout=900,
     )
     ref = TemplateRef(
-        name=template_name,
+        name=name,
+        tag=f"recipe-{recipe['sha256'][:16]}",
+        template_id=build.template_id,
         build_id=build.build_id,
         recipe_sha256=recipe["sha256"],
         images=(BASE_TEMPLATE_IMAGE, *BASE_BUILDER_IMAGES),
@@ -414,7 +439,7 @@ def build_ffmpeg_template(
         manifest.write(manifest_path)
         return manifest
 
-    template_name = _content_name(name, recipe["sha256"])
+    template_name = _tagged_name(name, recipe["sha256"])
     pull_ffmpeg, install_model, inspect_ffmpeg = _ffmpeg_commands()
     builder = (
         Template()
@@ -435,7 +460,9 @@ def build_ffmpeg_template(
         request_timeout=900,
     )
     ref = TemplateRef(
-        name=template_name,
+        name=name,
+        tag=f"recipe-{recipe['sha256'][:16]}",
+        template_id=build.template_id,
         build_id=build.build_id,
         recipe_sha256=recipe["sha256"],
         images=(*manifest.base.images, FFMPEG_IMAGE_DIGEST),

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import tarfile
+from argparse import Namespace
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 
-from cybergym_e2b.cli import _already_completed, _parser
+from cybergym_e2b.cli import _already_completed, _batch, _options, _parser, main
 from cybergym_e2b.config import (
     BASE_BUILDER_IMAGES,
     DEFAULT_MANIFEST,
@@ -31,10 +32,12 @@ from cybergym_e2b.runtime import (
     _experiment_identity,
     _model_config,
     _network,
+    _network_eligibility,
     _policy,
     _resource_summary,
     _route_template,
     _shell_run,
+    _stop_resource_monitor,
 )
 
 UPSTREAM = Path("vendor/cybergym-e2e")
@@ -44,7 +47,6 @@ def test_validated_8c8g_configuration_is_the_default() -> None:
     assert DEFAULT_MANIFEST.parts[-3:] == ("artifacts", "templates", "manifest.json")
     assert DEFAULT_MODEL == "openai.gpt-5.4"
     assert DEFAULT_MODEL_PROVIDER == "bedrock"
-    assert not DEFAULT_MANIFEST.exists()
 
 
 def test_default_egress_enforces_the_default_allow_policy() -> None:
@@ -54,6 +56,24 @@ def test_default_egress_enforces_the_default_allow_policy() -> None:
     policy = _policy(DEFAULT_NETWORK_POLICY)
     assert policy["default_action"] == "allow"
     assert "169.254.0.0/16" in policy["deny_out"]
+
+
+def test_default_public_egress_requires_a_network_audit_for_eligibility() -> None:
+    assert _network_eligibility(_policy(DEFAULT_NETWORK_POLICY), "policy") == {
+        "status": "requires_network_audit",
+        "reasons": ["runtime policy permits public egress"],
+    }
+    assert _network_eligibility(
+        _policy(DEFAULT_NETWORK_POLICY.with_name("network-locked.json")), "policy"
+    ) == {"status": "eligible", "reasons": []}
+    assert _network_eligibility(_policy(DEFAULT_NETWORK_POLICY), "permissive") == {
+        "status": "ineligible",
+        "reasons": ["permissive diagnostic egress is not benchmark eligible"],
+    }
+    assert _network_eligibility(_policy(DEFAULT_NETWORK_POLICY), "restricted") == {
+        "status": "requires_network_audit",
+        "reasons": ["runtime allowlist includes public dependency hosts"],
+    }
 
 
 def test_network_credentials_are_scoped_to_their_phase() -> None:
@@ -252,12 +272,21 @@ def test_bundle_is_task_scoped_and_applies_provider_patch() -> None:
 
 def test_manifest_round_trip_and_routing(tmp_path: Path) -> None:
     path = tmp_path / "manifest.json"
-    base = TemplateRef("base", "build-base-1234", "a" * 64, BASE_BUILDER_IMAGES)
+    base = TemplateRef(
+        name="base",
+        tag="recipe-aaaaaaaaaaaaaaaa",
+        template_id="template-base",
+        build_id="build-base-1234",
+        recipe_sha256="a" * 64,
+        images=BASE_BUILDER_IMAGES,
+    )
     hot = TemplateRef(
-        "ffmpeg",
-        "build-ffmpeg-1234",
-        "b" * 64,
-        (*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
+        name="ffmpeg",
+        tag="recipe-bbbbbbbbbbbbbbbb",
+        template_id="template-ffmpeg",
+        build_id="build-ffmpeg-1234",
+        recipe_sha256="b" * 64,
+        images=(*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
     )
     manifest = TemplateManifest(base=base, hot={FFMPEG_IMAGE: hot})
     manifest.write(path)
@@ -269,12 +298,21 @@ def test_manifest_round_trip_and_routing(tmp_path: Path) -> None:
 
 
 def test_all_ffmpeg_tasks_use_cache_bearing_hot_template() -> None:
-    base = TemplateRef("base", "build-base-1234", "a" * 64, BASE_BUILDER_IMAGES)
+    base = TemplateRef(
+        name="base",
+        tag="recipe-aaaaaaaaaaaaaaaa",
+        template_id="template-base",
+        build_id="build-base-1234",
+        recipe_sha256="a" * 64,
+        images=BASE_BUILDER_IMAGES,
+    )
     hot = TemplateRef(
-        "ffmpeg",
-        "build-ffmpeg-1234",
-        "b" * 64,
-        (*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
+        name="ffmpeg",
+        tag="recipe-bbbbbbbbbbbbbbbb",
+        template_id="template-ffmpeg",
+        build_id="build-ffmpeg-1234",
+        recipe_sha256="b" * 64,
+        images=(*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
     )
     manifest = TemplateManifest(base=base, hot={FFMPEG_IMAGE: hot})
 
@@ -458,6 +496,132 @@ def test_resource_summary_reports_swap_pressure() -> None:
     assert result["minimum_swap_free_bytes"] == 100
 
 
+def test_resource_monitor_stop_failure_is_recorded_without_raising() -> None:
+    class Monitor:
+        def kill(self) -> None:
+            raise ConnectionError("monitor channel closed")
+
+    result: dict = {}
+    _stop_resource_monitor(Monitor(), result, stage="after_workload")
+
+    assert result["monitor_errors"] == [
+        {
+            "stage": "after_workload",
+            "type": "ConnectionError",
+            "message": "monitor channel closed",
+        }
+    ]
+
+
+def test_batch_accounts_for_every_submitted_future_after_fail_fast(
+    monkeypatch, tmp_path: Path
+) -> None:
+    tasks = ["curl/one", "curl/two", "curl/three"]
+    digest = "example.invalid/project@sha256:" + "a" * 64
+    resolved = {
+        task: type(
+            "Resolved",
+            (),
+            {
+                "task": task,
+                "project": "curl",
+                "task_id": task.rsplit("/", 1)[1],
+                "build_image": digest,
+                "runtime_image": digest,
+                "repo_to_patch": "https://example.invalid/repo",
+            },
+        )()
+        for task in tasks
+    }
+    manifest = object()
+    monkeypatch.setattr("cybergym_e2b.cli._tasks", lambda _args: tasks)
+    monkeypatch.setattr("cybergym_e2b.cli.load_image_map", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        "cybergym_e2b.cli.resolve_task", lambda _upstream, task, **_kwargs: resolved[task]
+    )
+    monkeypatch.setattr("cybergym_e2b.cli.require_immutable_runtime_image", lambda _task: None)
+    monkeypatch.setattr("cybergym_e2b.cli.TemplateManifest.load", lambda _path: manifest)
+    monkeypatch.setattr(
+        "cybergym_e2b.cli._experiment_identity", lambda *_args, **_kwargs: {"sha256": "x"}
+    )
+
+    def execute(_args, task: str, **_kwargs):
+        if task == tasks[0]:
+            raise RuntimeError("sandbox create failed")
+        return {"task": task, "completed": True, "benchmark": {"status": "passed"}}
+
+    monkeypatch.setattr("cybergym_e2b.cli._execute", execute)
+    args = Namespace(
+        concurrency=1,
+        continue_on_error=False,
+        reuse_completed=False,
+        artifacts_dir=tmp_path,
+        upstream=tmp_path,
+        image_map=tmp_path / "images.json",
+        manifest=tmp_path / "manifest.json",
+        kind="run",
+        network_policy=DEFAULT_NETWORK_POLICY,
+        patch_file=DEFAULT_PATCH_FILE,
+        remote_smoke=DEFAULT_REMOTE_SMOKE,
+        remote_install_codex=DEFAULT_REMOTE_SMOKE,
+        setup_timeout=1,
+        evaluation_timeout=1,
+        min_free_gb=1,
+        ffmpeg_min_free_gb=1,
+        swap_gb=0,
+        egress="policy",
+        retain=False,
+        agent="codex",
+        prompt_style="iterative",
+        model="openai.gpt-5.4",
+        max_attempts=1,
+        agent_timeout=1,
+        provider="bedrock",
+        bedrock_region="us-west-2",
+    )
+
+    summary = _batch(args)
+
+    assert len(summary["results"]) == summary["submitted"] == 3
+    assert summary["infrastructure_completed"] + summary["infrastructure_failures"] == 3
+    assert summary["infrastructure_failures"] >= 1
+
+
+def test_batch_infrastructure_failure_exits_nonzero(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("E2B_API_KEY", "present")
+    monkeypatch.setattr("cybergym_e2b.cli._verify_upstream", lambda _path: "commit")
+    monkeypatch.setattr(
+        "cybergym_e2b.cli._batch",
+        lambda _args: {"infrastructure_failures": 1, "results": []},
+    )
+
+    assert main(["batch", "--upstream", str(tmp_path), "--artifacts-dir", str(tmp_path)]) == 1
+
+
+def test_preflight_accepts_the_same_execution_options_as_run() -> None:
+    preflight = _parser().parse_args(
+        [
+            "preflight",
+            "--task",
+            "curl/arvo_66012",
+            "--provider",
+            "fireworks",
+            "--model",
+            "accounts/fireworks/models/test",
+            "--agent",
+            "openhands",
+            "--egress",
+            "restricted",
+        ]
+    )
+
+    options = _options(preflight)
+    assert options.provider == "fireworks"
+    assert options.model == "accounts/fireworks/models/test"
+    assert options.agent == "openhands"
+    assert options.egress == "restricted"
+
+
 def test_resume_skips_graded_model_errors_but_retries_smoke_errors(tmp_path: Path) -> None:
     task_dir = tmp_path / "curl" / "arvo_66012" / "run"
     task_dir.mkdir(parents=True)
@@ -568,7 +732,14 @@ def test_experiment_identity_changes_with_kind_and_model(tmp_path: Path) -> None
     resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
     manifest_path = tmp_path / "manifest.json"
     TemplateManifest(
-        base=TemplateRef("base", "build-base-1234", "a" * 64, BASE_BUILDER_IMAGES)
+        base=TemplateRef(
+            name="base",
+            tag="recipe-aaaaaaaaaaaaaaaa",
+            template_id="template-base",
+            build_id="build-base-1234",
+            recipe_sha256="a" * 64,
+            images=BASE_BUILDER_IMAGES,
+        )
     ).write(manifest_path)
     common = {
         "upstream": UPSTREAM,

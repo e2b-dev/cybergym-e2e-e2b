@@ -35,6 +35,7 @@ from cybergym_e2b.config import (
     UPSTREAM_COMMIT,
     UPSTREAM_REPOSITORY,
     TemplateManifest,
+    TemplateRef,
     require_digest_locked_image,
 )
 from cybergym_e2b.inventory import (
@@ -43,6 +44,7 @@ from cybergym_e2b.inventory import (
     require_immutable_runtime_image,
     resolved_asdict,
 )
+from cybergym_e2b.templates import verify_template_ref
 
 EgressMode = Literal["policy", "restricted", "permissive"]
 ModelProvider = Literal["fireworks", "bedrock"]
@@ -64,6 +66,15 @@ class RunOptions:
     agent_timeout: int = 5400
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
     bedrock_region: str = "us-west-2"
+
+
+@dataclass(frozen=True)
+class ExecutionContext:
+    manifest: TemplateManifest
+    template: TemplateRef
+    policy: dict[str, Any]
+    non_http: list[dict]
+    model_config: dict[str, str | None]
 
 
 class _StageProfiler:
@@ -258,6 +269,26 @@ def _network(
         hosts = runtime_hosts + policy["artifact_hosts"] + policy["registry_hosts"]
     network.update({"deny_out": ["0.0.0.0/0"], "allow_out": sorted(set(hosts))})
     return network
+
+
+def _network_eligibility(policy: dict[str, Any], egress: EgressMode) -> dict[str, Any]:
+    """Classify benchmark eligibility without treating public egress as pre-audited."""
+    if egress == "permissive":
+        return {
+            "status": "ineligible",
+            "reasons": ["permissive diagnostic egress is not benchmark eligible"],
+        }
+    if egress == "policy" and policy["default_action"] == "allow":
+        return {
+            "status": "requires_network_audit",
+            "reasons": ["runtime policy permits public egress"],
+        }
+    if policy["runtime_dependency_hosts"] or policy["non_http_hosts"]:
+        return {
+            "status": "requires_network_audit",
+            "reasons": ["runtime allowlist includes public dependency hosts"],
+        }
+    return {"status": "eligible", "reasons": []}
 
 
 def _update_network(sandbox: Sandbox, network: dict[str, Any]) -> None:
@@ -541,6 +572,31 @@ def _route_template(manifest: TemplateManifest, *, project: str, build_image: st
     if project == "ffmpeg" and FFMPEG_IMAGE in manifest.hot:
         return manifest.hot[FFMPEG_IMAGE]
     return manifest.route(build_image)
+
+
+def _execution_context(
+    resolved: ResolvedTask,
+    *,
+    options: RunOptions,
+    manifest_path: Path,
+    network_policy_path: Path,
+) -> ExecutionContext:
+    """Resolve the exact template, model, and network inputs used by preflight and runtime."""
+    require_immutable_runtime_image(resolved)
+    manifest = TemplateManifest.load(manifest_path)
+    template = _route_template(
+        manifest,
+        project=resolved.project,
+        build_image=resolved.build_image,
+    )
+    policy = _policy(network_policy_path)
+    return ExecutionContext(
+        manifest=manifest,
+        template=template,
+        policy=policy,
+        non_http=_resolve_non_http(policy, resolved.project),
+        model_config=_model_config(options),
+    )
 
 
 def _enable_swap(sandbox: Sandbox, size_gb: int) -> dict[str, Any]:
@@ -943,6 +999,16 @@ def _finalize(sandbox: Sandbox, retain: bool, result: dict) -> None:
     result["cleanup_error"] = f"{type(cleanup_error).__name__}: {cleanup_error}"
 
 
+def _stop_resource_monitor(monitor: Any, result: dict, *, stage: str) -> None:
+    """Best-effort monitor cleanup that cannot suppress run finalization."""
+    try:
+        monitor.kill()
+    except Exception as exc:
+        result.setdefault("monitor_errors", []).append(
+            {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
+        )
+
+
 def execute_task(
     resolved: ResolvedTask,
     *,
@@ -958,20 +1024,26 @@ def execute_task(
     batch_id: str | None = None,
     experiment: dict[str, Any] | None = None,
 ) -> dict:
-    require_immutable_runtime_image(resolved)
+    context = _execution_context(
+        resolved,
+        options=options,
+        manifest_path=manifest_path,
+        network_policy_path=network_policy_path,
+    )
     hf_token = _secret("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
     if not hf_token:
         raise RuntimeError(
             "HF_TOKEN is required and must have accepted the gated CyberGym-E2E dataset"
         )
-    model_config = _model_config(options)
+    model_config = context.model_config
     model_key = model_config["key"]
     if kind == "run" and not model_key:
         raise RuntimeError(f"{model_config['key_name']} is required for {options.provider}")
-    manifest = TemplateManifest.load(manifest_path)
-    template = _route_template(manifest, project=resolved.project, build_image=resolved.build_image)
-    policy = _policy(network_policy_path)
-    non_http = _resolve_non_http(policy, resolved.project)
+    manifest = context.manifest
+    template = context.template
+    policy = context.policy
+    non_http = context.non_http
+    template_receipt = verify_template_ref(template)
     profiler = _StageProfiler()
     with profiler.stage("client_bundle_build"):
         bundle = build_code_bundle(
@@ -1000,12 +1072,13 @@ def execute_task(
     output = artifacts_dir / resolved.project / resolved.task_id / run_id
     output.mkdir(parents=True, exist_ok=True)
     result: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": kind,
         "run_id": run_id,
         "batch_id": batch_id,
         "task": resolved_asdict(resolved),
         "template": template.reference,
+        "template_receipt": {**template_receipt, "recipe_sha256": template.recipe_sha256},
         "experiment": experiment,
         "resources": {
             "cpu_count": manifest.cpu_count,
@@ -1031,7 +1104,7 @@ def execute_task(
                 if options.egress == "permissive"
                 else policy["default_action"]
             ),
-            "benchmark_eligible": options.egress != "permissive",
+            "eligibility": _network_eligibility(policy, options.egress),
             "secrets": "proxy-only",
             "non_http_egress": non_http,
         },
@@ -1149,7 +1222,7 @@ def execute_task(
         finally:
             if resource_monitor is not None:
                 with profiler.stage("resource_monitor_stop"):
-                    resource_monitor.kill()
+                    _stop_resource_monitor(resource_monitor, result, stage="after_workload")
                 resource_monitor = None
             with profiler.stage("resource_summary"):
                 result["observed_resources"] = _resource_summary(sandbox)
@@ -1167,7 +1240,7 @@ def execute_task(
         if sandbox is not None:
             if resource_monitor is not None:
                 with profiler.stage("resource_monitor_stop_after_failure"):
-                    resource_monitor.kill()
+                    _stop_resource_monitor(resource_monitor, result, stage="after_failure")
                 resource_monitor = None
             with profiler.stage("resource_summary_after_failure"):
                 result["observed_resources"] = _resource_summary(sandbox)
@@ -1185,7 +1258,7 @@ def execute_task(
         if sandbox is not None:
             if resource_monitor is not None:
                 with profiler.stage("resource_monitor_stop_finally"):
-                    resource_monitor.kill()
+                    _stop_resource_monitor(resource_monitor, result, stage="finalize")
             with profiler.stage("sandbox_finalize"):
                 _finalize(sandbox, options.retain, result)
         result["profile"] = profiler.result()

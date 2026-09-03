@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
@@ -41,11 +41,17 @@ from cybergym_e2b.inventory import (
 from cybergym_e2b.runtime import (
     RunOptions,
     _codex_turn_state,
+    _execution_context,
     _experiment_identity,
+    _network_eligibility,
     execute_task,
     preflight_access,
 )
-from cybergym_e2b.templates import build_base_template, build_ffmpeg_template
+from cybergym_e2b.templates import (
+    build_base_template,
+    build_ffmpeg_template,
+    verify_template_ref,
+)
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -142,14 +148,9 @@ def _parser() -> argparse.ArgumentParser:
     preflight = sub.add_parser("preflight", help="verify checkout, manifest, keys, and HF access")
     _common(preflight)
     preflight.add_argument("--task", default="curl/arvo_66012")
-    preflight.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    preflight.add_argument(
-        "--image-lock",
-        "--image-map",
-        dest="image_map",
-        type=Path,
-        default=DEFAULT_IMAGE_LOCK,
-    )
+    preflight.add_argument("--kind", choices=["run", "smoke"], default="run")
+    _run_options(preflight)
+    _agent_options(preflight)
 
     smoke = sub.add_parser("smoke", help="compile one task and run ground-truth stage 4")
     _common(smoke)
@@ -363,10 +364,18 @@ def _batch(args: argparse.Namespace) -> dict:
             ): task
             for task, resolved, experiment in work
         }
+        cancel_requested = False
         for future in as_completed(futures):
             task = futures[future]
             try:
                 result = future.result()
+            except CancelledError as exc:
+                result = {
+                    "task": task,
+                    "completed": False,
+                    "canceled": True,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
             except Exception as exc:
                 result = {
                     "task": task,
@@ -385,16 +394,18 @@ def _batch(args: argparse.Namespace) -> dict:
                 ),
                 flush=True,
             )
-            if result.get("error") and not args.continue_on_error:
+            if result.get("error") and not args.continue_on_error and not cancel_requested:
+                cancel_requested = True
                 for pending in futures:
-                    pending.cancel()
-                break
+                    if pending is not future:
+                        pending.cancel()
     summary["infrastructure_completed"] = sum(
         bool(item.get("completed")) for item in summary["results"]
     )
     summary["infrastructure_failures"] = (
         len(summary["results"]) - summary["infrastructure_completed"]
     )
+    summary["canceled"] = sum(bool(item.get("canceled")) for item in summary["results"])
     summary["benchmark_passed"] = sum(
         item.get("benchmark", {}).get("status") == "passed" for item in summary["results"]
     )
@@ -477,19 +488,54 @@ def main(argv: list[str] | None = None) -> int:
                 args.task,
                 image_map=load_image_map(args.image_map, upstream=args.upstream),
             )
-            require_immutable_runtime_image(resolved)
-            manifest = TemplateManifest.load(args.manifest)
+            options = _options(args)
+            context = _execution_context(
+                resolved,
+                options=options,
+                manifest_path=args.manifest,
+                network_policy_path=args.network_policy,
+            )
             hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
             hf = preflight_access(resolved.task, hf_token)
+            e2b_key_present = bool(os.environ.get("E2B_API_KEY"))
+            model_key_present = bool(context.model_config["key"])
+            template_verification: dict
+            if e2b_key_present:
+                try:
+                    template_verification = {"ok": True, **verify_template_ref(context.template)}
+                except Exception as exc:
+                    template_verification = {
+                        "ok": False,
+                        "error": {"type": type(exc).__name__, "message": str(exc)},
+                    }
+            else:
+                template_verification = {"ok": False, "reason": "E2B_API_KEY is missing"}
+            credentials_ok = args.kind == "smoke" or model_key_present
             result = {
-                "ok": bool(os.environ.get("E2B_API_KEY")) and hf["ok"],
+                "ok": e2b_key_present
+                and hf["ok"]
+                and credentials_ok
+                and template_verification["ok"],
                 "upstream_commit": commit,
+                "kind": args.kind,
                 "task": resolved.task,
                 "build_image": resolved.build_image,
                 "runtime_image": resolved.runtime_image,
-                "template": manifest.route(resolved.build_image).reference,
+                "template": {
+                    "reference": context.template.reference,
+                    "template_id": context.template.template_id,
+                    "build_id": context.template.build_id,
+                    "recipe_sha256": context.template.recipe_sha256,
+                },
+                "template_verification": template_verification,
+                "network_eligibility": _network_eligibility(context.policy, options.egress),
                 "keys_loaded": sorted(loaded),
-                "e2b_api_key_present": bool(os.environ.get("E2B_API_KEY")),
+                "e2b_api_key_present": e2b_key_present,
+                "selected_model_key": {
+                    "name": context.model_config["key_name"],
+                    "present": model_key_present,
+                    "required": args.kind == "run",
+                },
                 "fireworks_key_present": bool(
                     os.environ.get("FIREWORKS_AI_API_KEY") or os.environ.get("FIREWORKS_API_KEY")
                 ),
@@ -517,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.command == "preflight" and not result.get("ok"):
+        return 1
+    if args.command == "batch" and result.get("infrastructure_failures"):
         return 1
     return 1 if result.get("error") else 0
 

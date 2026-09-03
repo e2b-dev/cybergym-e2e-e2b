@@ -17,7 +17,7 @@ from cybergym_e2b.config import (
 )
 from cybergym_e2b.inventory import ResolvedTask
 from cybergym_e2b.runtime import RunOptions, _experiment_identity
-from cybergym_e2b.templates import build_base_template
+from cybergym_e2b.templates import build_base_template, verify_template_ref
 
 
 class _Builder:
@@ -31,7 +31,14 @@ class _Builder:
 def test_runtime_identity_rejects_a_mutable_project_image(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.json"
     TemplateManifest(
-        base=TemplateRef("base-a", "build-base-1234", "a" * 64, BASE_BUILDER_IMAGES)
+        base=TemplateRef(
+            name="base-a",
+            tag="recipe-aaaaaaaaaaaaaaaa",
+            template_id="template-base-a",
+            build_id="build-base-1234",
+            recipe_sha256="a" * 64,
+            images=BASE_BUILDER_IMAGES,
+        )
     ).write(manifest_path)
     policy = tmp_path / "network.json"
     policy.write_text("{}", encoding="utf-8")
@@ -79,7 +86,14 @@ def test_template_build_is_content_addressed_and_reuses_only_ledger_match(
 
     def build(_builder, name: str, **_kwargs):
         built_names.append(name)
-        return type("Build", (), {"build_id": f"build-{len(built_names):08d}"})()
+        return type(
+            "Build",
+            (),
+            {
+                "template_id": "tpl-cybergym-base",
+                "build_id": f"build-{len(built_names):08d}",
+            },
+        )()
 
     monkeypatch.setattr("cybergym_e2b.templates.Template.build", build)
     first = build_base_template(
@@ -97,8 +111,11 @@ def test_template_build_is_content_addressed_and_reuses_only_ledger_match(
 
     assert len(built_names) == 1
     assert first.base == second.base
-    assert first.base.name.startswith("cybergym-base-")
-    assert first.base.name.endswith(first.base.recipe_sha256[:16])
+    assert first.base.name == "cybergym-base"
+    assert first.base.tag == f"recipe-{first.base.recipe_sha256[:16]}"
+    assert first.base.reference == f"cybergym-base:recipe-{first.base.recipe_sha256[:16]}"
+    assert first.base.template_id == "tpl-cybergym-base"
+    assert built_names == [first.base.reference]
     assert json.loads(ledger.read_text(encoding="utf-8"))["records"]
 
     alternate_namespace = build_base_template(
@@ -108,7 +125,8 @@ def test_template_build_is_content_addressed_and_reuses_only_ledger_match(
         ledger_path=ledger,
     )
     assert len(built_names) == 2
-    assert alternate_namespace.base.name.startswith("another-base-")
+    assert alternate_namespace.base.name == "another-base"
+    assert alternate_namespace.base.reference.startswith("another-base:recipe-")
 
     requirements.write_text(
         "demo==1.2.4 --hash=sha256:" + "b" * 64 + "\n",
@@ -121,7 +139,33 @@ def test_template_build_is_content_addressed_and_reuses_only_ledger_match(
         ledger_path=ledger,
     )
     assert len(built_names) == 3
-    assert changed.base.name != first.base.name
+    assert changed.base.name == first.base.name
+    assert changed.base.tag != first.base.tag
+
+
+def test_template_tag_must_still_point_to_recorded_build(monkeypatch) -> None:
+    ref = TemplateRef(
+        name="cybergym-base",
+        tag="recipe-0123456789abcdef",
+        template_id="tpl-cybergym-base",
+        build_id="build-base-1234",
+        recipe_sha256="0123456789abcdef" + "a" * 48,
+        images=BASE_BUILDER_IMAGES,
+    )
+
+    monkeypatch.setattr(
+        "cybergym_e2b.templates.Template.get_tags",
+        lambda _template_id: [
+            type(
+                "Tag",
+                (),
+                {"tag": "recipe-0123456789abcdef", "build_id": "build-replaced-9999"},
+            )()
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="no longer points to recorded build"):
+        verify_template_ref(ref)
 
 
 def test_template_recipe_identity_covers_rendered_build_commands(
@@ -160,6 +204,20 @@ def test_template_recipe_identity_covers_rendered_build_commands(
     assert original_recipe["sha256"] != changed_recipe["sha256"]
 
 
+def test_template_install_excludes_unpinned_recommended_packages(tmp_path: Path) -> None:
+    from cybergym_e2b import templates
+
+    requirements = tmp_path / "requirements.lock"
+    requirements.write_text(
+        "demo==1.2.3 --hash=sha256:" + "a" * 64 + "\n",
+        encoding="utf-8",
+    )
+    payload = templates._validate_requirements_lock(requirements)
+    install, _, _ = templates._base_commands(payload)
+
+    assert install.count("apt-get install -y --no-install-recommends") == 2
+
+
 def test_template_build_rejects_unlocked_python_requirements(tmp_path: Path) -> None:
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("httpx>=0.28,<0.29\n", encoding="utf-8")
@@ -188,7 +246,14 @@ def test_cli_defaults_resolve_packaged_runtime_assets_outside_checkout(
 
 def test_manifest_rejects_mutable_recorded_images(tmp_path: Path) -> None:
     path = tmp_path / "manifest.json"
-    ref = TemplateRef("base", "build-base-1234", "a" * 64, ("ubuntu:22.04",))
+    ref = TemplateRef(
+        name="base",
+        tag="recipe-aaaaaaaaaaaaaaaa",
+        template_id="template-base",
+        build_id="build-base-1234",
+        recipe_sha256="a" * 64,
+        images=("ubuntu:22.04",),
+    )
     TemplateManifest(base=ref).write(path)
 
     with pytest.raises(ValueError, match="digest-locked"):

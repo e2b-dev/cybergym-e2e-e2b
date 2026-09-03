@@ -99,7 +99,10 @@ DEFAULT_FFMPEG_TEMPLATE_NAME = "cybergym-e2e-ffmpeg"
 DEFAULT_MODEL = "openai.gpt-5.4"
 DEFAULT_MODEL_PROVIDER = "bedrock"
 _TASK_PATH = re.compile(r"^[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+$")
-_BUILD_ID = re.compile(r"^[a-z0-9][a-z0-9-]{7,}$")
+_TEMPLATE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_TEMPLATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,}$")
+_BUILD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,}$")
+_RECIPE_TAG = re.compile(r"^recipe-([0-9a-f]{16})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 
@@ -151,6 +154,8 @@ def normalize_task(task: str) -> str:
 @dataclass(frozen=True)
 class TemplateRef:
     name: str
+    tag: str
+    template_id: str
     build_id: str
     recipe_sha256: str
     images: tuple[str, ...] = ()
@@ -158,14 +163,18 @@ class TemplateRef:
     @property
     def reference(self) -> str:
         if (
-            not self.name
+            not _TEMPLATE_NAME.fullmatch(self.name)
+            or not _TEMPLATE_ID.fullmatch(self.template_id)
             or not _BUILD_ID.fullmatch(self.build_id)
             or not _SHA256.fullmatch(self.recipe_sha256)
         ):
-            raise ValueError("template does not have an immutable build reference")
+            raise ValueError("template does not have a valid tagged build receipt")
+        tag_match = _RECIPE_TAG.fullmatch(self.tag)
+        if not tag_match or tag_match.group(1) != self.recipe_sha256[:16]:
+            raise ValueError("template tag does not match its build recipe")
         for image in self.images:
             require_digest_locked_image(image, label="recorded template image")
-        return f"{self.name}:{self.build_id}"
+        return f"{self.name}:{self.tag}"
 
 
 @dataclass
@@ -185,7 +194,7 @@ class TemplateManifest:
 
     def write(self, path: Path = DEFAULT_MANIFEST) -> None:
         payload = {
-            "schema_version": 3,
+            "schema_version": 4,
             "resources": {
                 "cpu_count": self.cpu_count,
                 "memory_mb": self.memory_mb,
@@ -204,7 +213,7 @@ class TemplateManifest:
     @classmethod
     def load(cls, path: Path = DEFAULT_MANIFEST) -> TemplateManifest:
         raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-        if raw.get("schema_version") != 3:
+        if raw.get("schema_version") != 4:
             raise ValueError("unsupported template manifest schema")
         if raw.get("upstream") != {
             "code_commit": UPSTREAM_COMMIT,
@@ -215,6 +224,8 @@ class TemplateManifest:
         base_raw = raw["base"]
         base = TemplateRef(
             name=base_raw["name"],
+            tag=base_raw["tag"],
+            template_id=base_raw["template_id"],
             build_id=base_raw["build_id"],
             recipe_sha256=base_raw["recipe_sha256"],
             images=tuple(base_raw.get("images", ())),
@@ -222,6 +233,8 @@ class TemplateManifest:
         hot = {
             image: TemplateRef(
                 name=value["name"],
+                tag=value["tag"],
+                template_id=value["template_id"],
                 build_id=value["build_id"],
                 recipe_sha256=value["recipe_sha256"],
                 images=tuple(value.get("images", ())),
