@@ -27,6 +27,7 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "cybergym_e2b"
 source-include = [
+  ".env.example",
   ".gitignore",
   ".github/workflows/ci.yml",
   "LICENSE",

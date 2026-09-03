@@ -2,6 +2,7 @@
 
 import importlib.util
 import subprocess
+import tarfile
 from pathlib import Path
 
 
@@ -16,6 +17,23 @@ def _load_public_tree_module():
 
 public_tree = _load_public_tree_module()
 find_forbidden_paths = public_tree.find_forbidden_paths
+
+
+def test_source_distribution_includes_environment_example(tmp_path: Path) -> None:
+    repository = Path(__file__).parents[1]
+    subprocess.run(
+        ["uv", "build", "--sdist", "--out-dir", str(tmp_path)],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    [sdist] = tmp_path.glob("*.tar.gz")
+
+    with tarfile.open(sdist, mode="r:gz") as archive:
+        members = archive.getnames()
+
+    assert any(member.endswith("/.env.example") for member in members)
 
 
 def test_public_tree_policy_rejects_secrets_and_generated_paths():
