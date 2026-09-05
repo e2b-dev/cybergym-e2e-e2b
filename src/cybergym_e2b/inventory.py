@@ -16,6 +16,7 @@ import tomli_w
 from cybergym_e2b.config import (
     DEFAULT_BUILD_IMAGE,
     DEFAULT_PATCH_FILE,
+    DEFAULT_REMOTE_APT_RETRY,
     DEFAULT_REMOTE_INSTALL_CODEX,
     DEFAULT_REMOTE_SMOKE,
     FFMPEG_IMAGE,
@@ -167,6 +168,7 @@ def build_code_bundle(
     patch_file: Path = DEFAULT_PATCH_FILE,
     remote_smoke: Path = DEFAULT_REMOTE_SMOKE,
     remote_install_codex: Path = DEFAULT_REMOTE_INSTALL_CODEX,
+    remote_apt_retry: Path = DEFAULT_REMOTE_APT_RETRY,
 ) -> bytes:
     """Pack upstream scripts plus one project/task; HF source blobs stay out of this bundle."""
     with tempfile.TemporaryDirectory(prefix="cybergym-e2b-bundle-") as temp_name:
@@ -182,6 +184,7 @@ def build_code_bundle(
         shutil.copy2(remote_smoke, temp / "scripts" / "e2b_smoke.py")
         if remote_install_codex.is_file():
             shutil.copy2(remote_install_codex, temp / "scripts" / "install_codex.sh")
+        shutil.copy2(remote_apt_retry, temp / "scripts" / "apt_retry.sh")
         subprocess.run(
             [
                 "git",

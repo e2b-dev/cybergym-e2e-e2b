@@ -28,6 +28,7 @@ from cybergym_e2b.config import (
     DEFAULT_MODEL_PROVIDER,
     DEFAULT_NETWORK_POLICY,
     DEFAULT_PATCH_FILE,
+    DEFAULT_REMOTE_APT_RETRY,
     DEFAULT_REMOTE_INSTALL_CODEX,
     DEFAULT_REMOTE_SMOKE,
     FFMPEG_IMAGE,
@@ -48,6 +49,7 @@ from cybergym_e2b.templates import verify_template_ref
 
 EgressMode = Literal["policy", "restricted", "permissive"]
 ModelProvider = Literal["fireworks", "bedrock"]
+ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class RunOptions:
     agent: str = "codex"
     prompt_style: str = "iterative"
     model: str = DEFAULT_MODEL
+    reasoning_effort: ReasoningEffort = "high"
     max_attempts: int = 1
     agent_timeout: int = 5400
     provider: ModelProvider = DEFAULT_MODEL_PROVIDER
@@ -120,6 +123,10 @@ class _StageProfiler:
 
 def _secret(name: str, fallback: str | None = None) -> str | None:
     return os.environ.get(name) or (os.environ.get(fallback) if fallback else None)
+
+
+def _summary_wire_api(agent: str) -> str:
+    return "responses" if agent == "codex" else "chat-completions"
 
 
 def _policy(path: Path) -> dict[str, Any]:
@@ -328,6 +335,7 @@ def _experiment_identity(
     patch_file: Path = DEFAULT_PATCH_FILE,
     remote_smoke: Path = DEFAULT_REMOTE_SMOKE,
     remote_install_codex: Path = DEFAULT_REMOTE_INSTALL_CODEX,
+    remote_apt_retry: Path = DEFAULT_REMOTE_APT_RETRY,
     manifest: TemplateManifest | None = None,
 ) -> dict[str, Any]:
     """Build the complete, deterministic identity used for artifact reuse."""
@@ -358,6 +366,7 @@ def _experiment_identity(
             "compatibility_patch_sha256": _path_sha256(str(patch_file.resolve())),
             "remote_smoke_sha256": _path_sha256(str(remote_smoke.resolve())),
             "remote_install_codex_sha256": _path_sha256(str(remote_install_codex.resolve())),
+            "remote_apt_retry_sha256": _path_sha256(str(remote_apt_retry.resolve())),
             "harness_sha256": _path_sha256(str(Path(__file__).resolve().parent)),
         },
     }
@@ -1021,6 +1030,7 @@ def execute_task(
     patch_file: Path = DEFAULT_PATCH_FILE,
     remote_smoke: Path = DEFAULT_REMOTE_SMOKE,
     remote_install_codex: Path = DEFAULT_REMOTE_INSTALL_CODEX,
+    remote_apt_retry: Path = DEFAULT_REMOTE_APT_RETRY,
     batch_id: str | None = None,
     experiment: dict[str, Any] | None = None,
 ) -> dict:
@@ -1052,6 +1062,7 @@ def execute_task(
             patch_file=patch_file,
             remote_smoke=remote_smoke,
             remote_install_codex=remote_install_codex,
+            remote_apt_retry=remote_apt_retry,
         )
     current_experiment = _experiment_identity(
         resolved,
@@ -1063,6 +1074,7 @@ def execute_task(
         patch_file=patch_file,
         remote_smoke=remote_smoke,
         remote_install_codex=remote_install_codex,
+        remote_apt_retry=remote_apt_retry,
         manifest=manifest,
     )
     if experiment is not None and experiment.get("sha256") != current_experiment["sha256"]:
@@ -1204,11 +1216,13 @@ def execute_task(
             upstream_model = _agent_model_id(options)
             command = (
                 cache_env + "export E2B_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; "
+                f"export E2B_OPENAI_WIRE_API={_summary_wire_api(options.agent)}; "
                 f"export OPENAI_BASE_URL={shlex.quote(str(model_config['base_url']))}; "
                 "export OPENAI_API_KEY=e2b-proxy-injected; "
                 f"cd {root} && /opt/cybergym-e2e-venv/bin/python scripts/run_agent.py "
                 f"{shlex.quote(resolved.task)} --mode e2e --agent {shlex.quote(options.agent)} "
                 f"--prompt-style {shlex.quote(options.prompt_style)} "
+                f"--reasoning-effort {shlex.quote(options.reasoning_effort)} "
                 f"--max-attempts {options.max_attempts} --timeout {options.agent_timeout} "
                 "--model-provider openai-compatible "
                 f"--litellm-model-id {shlex.quote(upstream_model)} "

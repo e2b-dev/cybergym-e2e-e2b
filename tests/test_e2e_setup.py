@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import ast
 import json
+import os
+import shutil
+import subprocess
+import sys
 import tarfile
 from argparse import Namespace
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 from cybergym_e2b.cli import _already_completed, _batch, _options, _parser, main
 from cybergym_e2b.config import (
@@ -15,6 +21,8 @@ from cybergym_e2b.config import (
     DEFAULT_MODEL_PROVIDER,
     DEFAULT_NETWORK_POLICY,
     DEFAULT_PATCH_FILE,
+    DEFAULT_REMOTE_APT_RETRY,
+    DEFAULT_REMOTE_INSTALL_CODEX,
     DEFAULT_REMOTE_SMOKE,
     FFMPEG_IMAGE,
     FFMPEG_IMAGE_DIGEST,
@@ -38,6 +46,7 @@ from cybergym_e2b.runtime import (
     _route_template,
     _shell_run,
     _stop_resource_monitor,
+    _summary_wire_api,
 )
 
 UPSTREAM = Path("vendor/cybergym-e2e")
@@ -47,6 +56,64 @@ def test_validated_8c8g_configuration_is_the_default() -> None:
     assert DEFAULT_MANIFEST.parts[-3:] == ("artifacts", "templates", "manifest.json")
     assert DEFAULT_MODEL == "openai.gpt-5.4"
     assert DEFAULT_MODEL_PROVIDER == "bedrock"
+    assert RunOptions().reasoning_effort == "high"
+
+
+def test_reasoning_effort_is_explicit_and_configurable() -> None:
+    default_args = _parser().parse_args(["run", "curl/arvo_66012"])
+    assert _options(default_args).reasoning_effort == "high"
+
+    args = _parser().parse_args(["run", "curl/arvo_66012", "--reasoning-effort", "xhigh"])
+    assert _options(args).reasoning_effort == "xhigh"
+
+
+def test_summary_wire_api_matches_agent_transport() -> None:
+    assert _summary_wire_api("codex") == "responses"
+    assert _summary_wire_api("openhands") == "chat-completions"
+    assert _summary_wire_api("gemini") == "chat-completions"
+
+
+def test_apt_retry_wrapper_covers_apt_and_apt_get(tmp_path: Path) -> None:
+    fake_real_dir = tmp_path / "real"
+    wrapper_dir = tmp_path / "wrapper"
+    fake_real_dir.mkdir()
+    wrapper_dir.mkdir()
+    fake_command = """#!/bin/sh
+count=$(cat "$E2B_APT_COUNTER" 2>/dev/null || printf 0)
+count=$((count + 1))
+printf '%s' "$count" > "$E2B_APT_COUNTER"
+printf '%s\\n' "$*" >> "$E2B_APT_ARGUMENTS"
+if [ "$1" = "-o" ] && [ "$count" -lt 3 ]; then exit 42; fi
+exit 0
+"""
+
+    for command_name in ("apt", "apt-get"):
+        real_command = fake_real_dir / command_name
+        real_command.write_text(fake_command, encoding="utf-8")
+        real_command.chmod(0o755)
+        wrapper = wrapper_dir / command_name
+        shutil.copy2(DEFAULT_REMOTE_APT_RETRY, wrapper)
+        wrapper.chmod(0o755)
+        counter = tmp_path / f"{command_name}.counter"
+        arguments = tmp_path / f"{command_name}.arguments"
+        env = {
+            **os.environ,
+            "E2B_APT_REAL_DIR": str(fake_real_dir),
+            "E2B_APT_RETRY_SLEEP": "0",
+            "E2B_APT_COUNTER": str(counter),
+            "E2B_APT_ARGUMENTS": str(arguments),
+        }
+
+        subprocess.run([str(wrapper), "update", "-qq"], env=env, check=True)
+        assert counter.read_text(encoding="utf-8") == "3"
+        calls = arguments.read_text(encoding="utf-8").splitlines()
+        assert len(calls) == 3
+        assert all("Acquire::Retries=3" in call for call in calls)
+        assert all("Acquire::http::No-Cache=true" in call for call in calls)
+
+        subprocess.run([str(wrapper), "install", "-y", "git"], env=env, check=True)
+        assert counter.read_text(encoding="utf-8") == "4"
+        assert arguments.read_text(encoding="utf-8").splitlines()[-1] == "install -y git"
 
 
 def test_default_egress_enforces_the_default_allow_policy() -> None:
@@ -244,6 +311,7 @@ def test_image_map_accepts_only_digest_locked_values(tmp_path: Path) -> None:
 
 
 def test_bundle_is_task_scoped_and_applies_provider_patch() -> None:
+    assert "if ! command -v curl" in DEFAULT_REMOTE_INSTALL_CODEX.read_text()
     resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
     payload = build_code_bundle(
         UPSTREAM,
@@ -259,15 +327,127 @@ def test_bundle_is_task_scoped_and_applies_provider_patch() -> None:
         utils = archive.extractfile("scripts/utils.py")
         assert utils is not None
         utils_source = utils.read().decode()
+        validator_installer = archive.extractfile("scripts/install_validate_deps.sh")
+        assert validator_installer is not None
+        validator_installer_source = validator_installer.read().decode()
     assert "projects/curl/arvo_66012/config.toml" in names
+    assert "scripts/apt_retry.sh" in names
     assert not any("projects/ffmpeg/" in name for name in names)
     assert '"openai-compatible"' in source
     assert 'wire_api = "responses"' in source
+    assert 'model_reasoning_effort = "{args.reasoning_effort}"' in source
+    assert source.index("model_reasoning_effort") < source.index("[model_providers.openai_http]")
+    assert 'parser.add_argument("--reasoning-effort"' in source
+    assert "if attempt < args.max_attempts:" in source
+    assert 'model_provider == "openai-compatible"' in utils_source
+    assert "client.responses.create(" in utils_source
+    assert 'httpx.Client(verify=os.environ.get("E2B_CA_BUNDLE", True))' in utils_source
+    assert "command -v sudo" in utils_source
+    assert 'exec \\"$@\\"' in utils_source
+    assert "command -v git" in utils_source
+    assert 'for apt_command in ("apt", "apt-get")' in utils_source
+    assert 'scripts_dir / "apt_retry.sh"' in utils_source
+    assert "poc_file is None or not poc_file.exists()" in source
+    assert "patch_file is None or not patch_file.exists()" in source
+    assert "if ! command -v curl" in validator_installer_source
+    compile(source, "scripts/run_agent.py", "exec")
+    compile(utils_source, "scripts/utils.py", "exec")
     assert 'os.environ.get("E2B_CA_BUNDLE")' in source
     assert 'os.getenv("E2B_OPUS_MODEL_CACHE")' in utils_source
     assert '"LLM_MAX_INPUT_TOKENS": "131072"' in utils_source
     assert '"LLM_MAX_OUTPUT_TOKENS": "8192"' in utils_source
     assert '"LLM_NATIVE_TOOL_CALLING": "true"' in utils_source
+
+
+def test_openai_compatible_summary_uses_agent_wire_api(monkeypatch) -> None:
+    resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
+    payload = build_code_bundle(UPSTREAM, resolved)
+    with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as archive:
+        utils = archive.extractfile("scripts/utils.py")
+        assert utils is not None
+        module = ast.parse(utils.read().decode())
+    call_llm_node = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "call_llm"
+    )
+
+    calls: list[tuple[str, dict]] = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            calls.append(("client", kwargs))
+            self.responses = SimpleNamespace(
+                create=lambda **call: (
+                    calls.append(("responses", call))
+                    or SimpleNamespace(output_text="responses summary")
+                )
+            )
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **call: (
+                        calls.append(("chat-completions", call))
+                        or SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(message=SimpleNamespace(content="chat summary"))
+                            ]
+                        )
+                    )
+                )
+            )
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    namespace = {
+        "boto3": SimpleNamespace(),
+        "httpx": SimpleNamespace(Client=lambda **kwargs: ("http-client", kwargs)),
+        "os": os,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[call_llm_node], type_ignores=[])),
+            "utils.py",
+            "exec",
+        ),
+        namespace,
+    )
+    call_llm = namespace["call_llm"]
+
+    monkeypatch.setenv("E2B_OPENAI_WIRE_API", "responses")
+    assert (
+        call_llm(
+            "summarize",
+            model_provider="openai-compatible",
+            litellm_model_id="openai/openai.gpt-5.4",
+        )
+        == "responses summary"
+    )
+    assert calls[-1] == (
+        "responses",
+        {
+            "model": "openai.gpt-5.4",
+            "input": "summarize",
+            "max_output_tokens": 2000,
+        },
+    )
+
+    monkeypatch.setenv("E2B_OPENAI_WIRE_API", "chat-completions")
+    assert (
+        call_llm(
+            "summarize",
+            model_provider="openai-compatible",
+            litellm_model_id="openai/openai.gpt-5.4",
+        )
+        == "chat summary"
+    )
+    assert calls[-1] == (
+        "chat-completions",
+        {
+            "model": "openai.gpt-5.4",
+            "messages": [{"role": "user", "content": "summarize"}],
+            "max_tokens": 2000,
+            "temperature": 0.0,
+        },
+    )
 
 
 def test_manifest_round_trip_and_routing(tmp_path: Path) -> None:
@@ -754,9 +934,16 @@ def test_experiment_identity_changes_with_kind_and_model(tmp_path: Path) -> None
         options=replace(RunOptions(), model="accounts/fireworks/models/another-model"),
         **common,
     )
+    other_reasoning_effort = _experiment_identity(
+        resolved,
+        kind="run",
+        options=replace(RunOptions(), reasoning_effort="xhigh"),
+        **common,
+    )
     assert len(run["sha256"]) == 64
     assert run["sha256"] != smoke["sha256"]
     assert run["sha256"] != other_model["sha256"]
+    assert run["sha256"] != other_reasoning_effort["sha256"]
 
 
 def test_fresh_sandbox_creation_uses_template_and_disables_auto_resume(monkeypatch) -> None:

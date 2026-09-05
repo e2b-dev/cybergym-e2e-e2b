@@ -91,6 +91,7 @@ DEFAULT_NETWORK_POLICY = asset_path("policies/network.json")
 DEFAULT_PATCH_FILE = asset_path("patches/openai-compatible.patch")
 DEFAULT_REMOTE_SMOKE = asset_path("remote/e2b_smoke.py")
 DEFAULT_REMOTE_INSTALL_CODEX = asset_path("remote/install_codex.sh")
+DEFAULT_REMOTE_APT_RETRY = asset_path("remote/apt_retry.sh")
 DEFAULT_TEMPLATE_REQUIREMENTS = asset_path("template-requirements.lock")
 # Project-local .env by default; override with CYBERGYM_KEYS_FILE for other setups.
 DEFAULT_KEYS_FILE = Path(os.environ.get("CYBERGYM_KEYS_FILE", ".env"))

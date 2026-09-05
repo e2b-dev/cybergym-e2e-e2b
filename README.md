@@ -138,6 +138,11 @@ uv run cybergym-e2b run curl/arvo_66012 \
   --model openai.gpt-5.4
 ```
 
+Codex runs use an explicit `high` reasoning effort by default. This avoids relying on the model
+API's lower implicit default or on Codex metadata inference for provider-specific model IDs. Use
+`--reasoning-effort low|medium|high|xhigh` to make a different comparison configuration explicit;
+the selected value is part of the experiment fingerprint.
+
 Run a bounded batch with an operator-owned task file:
 
 ```bash
