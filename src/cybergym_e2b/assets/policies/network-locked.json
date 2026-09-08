@@ -3,7 +3,7 @@
   "deny_out": [],
   "model_hosts": [
     "api.fireworks.ai",
-    "bedrock-mantle.us-west-2.api.aws"
+    "bedrock-mantle.*.api.aws"
   ],
   "artifact_hosts": [
     "huggingface.co",

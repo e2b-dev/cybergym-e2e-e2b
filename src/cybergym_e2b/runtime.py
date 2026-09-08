@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -268,7 +269,7 @@ def _network(
         network["deny_out"] = sorted(set(policy["deny_out"]))
         return network
     non_http_addresses = [address for entry in non_http for address in entry["addresses"]]
-    if model_host not in policy["model_hosts"]:
+    if not any(fnmatch.fnmatchcase(model_host, pattern) for pattern in policy["model_hosts"]):
         raise ValueError(f"model host {model_host!r} is not declared by the network policy")
     runtime_hosts = policy["runtime_dependency_hosts"] + [model_host] + non_http_addresses
     hosts = runtime_hosts
@@ -846,12 +847,17 @@ def _collect(sandbox: Sandbox, destination: Path) -> None:
     payload = bytes(sandbox.files.read("/tmp/cybergym-e2e-results.tgz", format="bytes"))
     archive_path = destination / "sandbox-results.tgz"
     archive_path.write_bytes(payload)
+    _extract_results(archive_path, destination / "sandbox")
+
+
+def _extract_results(archive_path: Path, root: Path) -> None:
+    root_resolved = root.resolve()
     with tarfile.open(archive_path, mode="r:gz") as archive:
         for member in archive.getmembers():
-            target = (destination / "sandbox").resolve() / member.name
-            if not target.is_relative_to((destination / "sandbox").resolve()):
+            target = Path(os.path.normpath(root_resolved / member.name))
+            if not target.is_relative_to(root_resolved):
                 raise RuntimeError("unsafe path in sandbox result archive")
-        archive.extractall(destination / "sandbox", filter="data")
+        archive.extractall(root, filter="data")
 
 
 def _codex_turn_state(destination: Path) -> dict[str, Any]:

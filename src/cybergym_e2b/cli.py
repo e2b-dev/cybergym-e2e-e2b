@@ -97,7 +97,7 @@ def _run_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _agent_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--agent", choices=["codex", "openhands", "gemini-cli"], default="codex")
+    parser.add_argument("--agent", choices=["codex", "openhands"], default="codex")
     parser.add_argument("--prompt-style", choices=["iterative", "no-test"], default="iterative")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
@@ -202,6 +202,11 @@ def _verify_upstream(path: Path) -> str:
     ).stdout.strip()
     if commit != UPSTREAM_COMMIT:
         raise RuntimeError(f"upstream checkout is {commit}, expected {UPSTREAM_COMMIT}")
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    if status:
+        raise RuntimeError(f"upstream checkout is dirty; run sync-upstream: {path}")
     return commit
 
 

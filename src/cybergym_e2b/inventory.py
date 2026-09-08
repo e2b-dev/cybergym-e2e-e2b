@@ -182,8 +182,7 @@ def build_code_bundle(
             project_target / resolved.task_id,
         )
         shutil.copy2(remote_smoke, temp / "scripts" / "e2b_smoke.py")
-        if remote_install_codex.is_file():
-            shutil.copy2(remote_install_codex, temp / "scripts" / "install_codex.sh")
+        shutil.copy2(remote_install_codex, temp / "scripts" / "install_codex.sh")
         shutil.copy2(remote_apt_retry, temp / "scripts" / "apt_retry.sh")
         subprocess.run(
             [

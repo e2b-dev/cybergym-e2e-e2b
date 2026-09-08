@@ -161,8 +161,10 @@ ranges. CyberGym instructs agents that network use invalidates the result. The a
 marks default-policy results `requires_network_audit`; inspect trajectories and network evidence
 before including them in a published comparison. `--egress restricted` uses a public dependency
 allowlist and also requires an audit. `--egress permissive` is diagnostic and is always ineligible.
-The packaged `network-locked.json` policy permits only the selected model endpoint during runtime
-and is eligible without a public-egress audit after all task dependencies have been preloaded.
+The packaged `network-locked.json` policy permits only the selected model endpoint during runtime.
+It is eligible without a public-egress audit only once agent tooling (Node, nvm, and Codex) is
+preloaded into the agent container. This release does not ship that preload, so agent runs under
+the locked policy fail during tooling install; use it only for diagnostics until then.
 
 Runtime assets can be overridden with `--patch-file`, `--remote-smoke`,
 `--remote-install-codex`, and `--network-policy`. Overrides are included in the experiment

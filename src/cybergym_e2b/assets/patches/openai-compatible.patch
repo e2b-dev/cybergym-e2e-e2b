@@ -64,7 +64,7 @@ index f8b8b82..54ae678 100644
 +    ).returncode == 0:
 +        copy_to_container(container_id, opus_model_cache, f"/src/opus/{Path(opus_model_cache).name}")
 +
-@@ -331,0 +351,24 @@ def call_llm(
+@@ -332,0 +352,24 @@ def call_llm(
 +        elif model_provider == "openai-compatible":
 +            import openai
 +
