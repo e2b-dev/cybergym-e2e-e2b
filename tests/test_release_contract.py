@@ -48,16 +48,10 @@ def test_public_tree_policy_rejects_secrets_and_generated_paths():
         "nested/.env.customer",
         "policies/network.json",
         "vendor/cybergym-e2e/tasks/example.toml",
-        "docs/validation/report.md",
-        "experiments/resource-study/config.json",
-        "campaigns/full-run.txt",
-        "reports/customer-summary.json",
         "template-manifest.8c8g.json",
         "artifacts/templates/build-ledger.json",
         "credentials.json",
         "tls/client.key",
-        "bedrock-campaign-tasks.txt",
-        "scripts/analyze_profiles.py",
         "examples/documented-tasks.txt",
     ]
 
@@ -66,15 +60,9 @@ def test_public_tree_policy_rejects_secrets_and_generated_paths():
         ".venv/pyvenv.cfg",
         "artifacts/run/result.json",
         "artifacts/templates/build-ledger.json",
-        "bedrock-campaign-tasks.txt",
-        "campaigns/full-run.txt",
         "credentials.json",
-        "docs/validation/report.md",
-        "experiments/resource-study/config.json",
         "nested/.env.customer",
         "package.egg-info/PKG-INFO",
-        "reports/customer-summary.json",
-        "scripts/analyze_profiles.py",
         "src/cybergym_e2b/__pycache__/runtime.pyc",
         "template-manifest.8c8g.json",
         "tls/client.key",
@@ -90,13 +78,13 @@ def test_public_tree_command_validates_an_extracted_tree_without_git(
     assert public_tree.main(tmp_path) == 0
     assert capsys.readouterr().out == "Public-tree policy passed.\n"
 
-    (tmp_path / "bedrock-campaign-tasks.txt").write_text("task\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("E2B_API_KEY=secret\n", encoding="utf-8")
 
     assert public_tree.main(tmp_path) == 1
-    assert "bedrock-campaign-tasks.txt" in capsys.readouterr().out
+    assert ".env" in capsys.readouterr().out
 
 
-def test_gitignore_rejects_root_campaign_lists_and_profile_analyzer(tmp_path: Path) -> None:
+def test_gitignore_covers_secrets_and_generated_state(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
     (repository / ".gitignore").write_text(
@@ -104,15 +92,16 @@ def test_gitignore_rejects_root_campaign_lists_and_profile_analyzer(tmp_path: Pa
         encoding="utf-8",
     )
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    candidates = [
+        ".env",
+        ".env.local",
+        ".env.example",
+        "artifacts/images.lock.json",
+        "artifacts/templates/manifest.json",
+        "vendor/cybergym-e2e/README.md",
+    ]
     completed = subprocess.run(
-        [
-            "git",
-            "check-ignore",
-            "--no-index",
-            "bedrock-campaign-tasks.txt",
-            "scripts/analyze_profiles.py",
-            "examples/documented-tasks.txt",
-        ],
+        ["git", "check-ignore", "--no-index", *candidates],
         check=False,
         capture_output=True,
         text=True,
@@ -121,6 +110,9 @@ def test_gitignore_rejects_root_campaign_lists_and_profile_analyzer(tmp_path: Pa
 
     assert completed.returncode == 0
     assert completed.stdout.splitlines() == [
-        "bedrock-campaign-tasks.txt",
-        "scripts/analyze_profiles.py",
+        ".env",
+        ".env.local",
+        "artifacts/images.lock.json",
+        "artifacts/templates/manifest.json",
+        "vendor/cybergym-e2e/README.md",
     ]

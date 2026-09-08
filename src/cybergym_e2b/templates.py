@@ -27,6 +27,7 @@ from cybergym_e2b.config import (
     OPUS_MODEL_CACHE,
     OPUS_MODEL_FILENAME,
     OPUS_MODEL_SHA256,
+    TEMPLATE_NAME,
     UPSTREAM_COMMIT,
     TemplateManifest,
     TemplateRef,
@@ -59,7 +60,6 @@ SYSTEM_PACKAGES = (
     "xz-utils",
 )
 _LOCKED_REQUIREMENT = re.compile(r"^[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[^\s\\]+")
-_TEMPLATE_PREFIX = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _BASE_FINALIZE_COMMAND = "docker system df && rm -rf /root/.cache /tmp/* && sync"
 _READY_COMMAND = "docker info >/dev/null"
 
@@ -113,10 +113,13 @@ def _recipe(kind: str, inputs: dict[str, Any]) -> dict[str, Any]:
     return {**payload, "sha256": _canonical_sha256(payload)}
 
 
-def _tagged_name(prefix: str, recipe_sha256: str) -> str:
-    if not _TEMPLATE_PREFIX.fullmatch(prefix):
-        raise ValueError("template name prefix must contain lowercase letters, digits, and hyphens")
-    return f"{prefix}:recipe-{recipe_sha256[:16]}"
+def _require_template_name(name: str) -> None:
+    if not TEMPLATE_NAME.fullmatch(name):
+        raise ValueError("template name must contain lowercase letters, digits, and hyphens")
+
+
+def _recipe_tag(recipe: dict[str, Any]) -> str:
+    return f"recipe-{recipe['sha256'][:16]}"
 
 
 @cache
@@ -207,8 +210,7 @@ def _base_recipe(
     if min(cpu_count, memory_mb, disk_limit_gb) <= 0:
         raise ValueError("template resource values must be positive")
     requirements_payload = _validate_requirements_lock(requirements)
-    if not _TEMPLATE_PREFIX.fullmatch(name):
-        raise ValueError("template name prefix must contain lowercase letters, digits, and hyphens")
+    _require_template_name(name)
     build_commands = _base_commands(requirements_payload)
     require_digest_locked_image(BASE_TEMPLATE_IMAGE, label="base template image")
     for image in BASE_BUILDER_IMAGES:
@@ -266,8 +268,7 @@ def _ffmpeg_commands() -> tuple[str, str, str]:
 
 def _ffmpeg_recipe(manifest: TemplateManifest, *, name: str) -> dict[str, Any]:
     require_digest_locked_image(FFMPEG_IMAGE_DIGEST, label="FFmpeg image")
-    if not _TEMPLATE_PREFIX.fullmatch(name):
-        raise ValueError("template name prefix must contain lowercase letters, digits, and hyphens")
+    _require_template_name(name)
     build_commands = _ffmpeg_commands()
     return _recipe(
         "ffmpeg",
@@ -343,8 +344,7 @@ class _BuildLedger:
         os.replace(temporary, self.path)
 
 
-def _docker_builder(requirements: Path):
-    requirements_payload = _validate_requirements_lock(requirements)
+def _docker_builder(requirements_payload: bytes):
     install, daemon, ensure_docker = _base_commands(requirements_payload)
     return (
         Template()
@@ -375,7 +375,7 @@ def build_base_template(
     memory_mb: int = 8192,
     disk_limit_gb: int = 120,
 ) -> TemplateManifest:
-    recipe, _ = _base_recipe(
+    recipe, requirements_payload = _base_recipe(
         requirements,
         name=name,
         cpu_count=cpu_count,
@@ -394,12 +394,12 @@ def build_base_template(
         manifest.write(manifest_path)
         return manifest
 
-    template_name = _tagged_name(name, recipe["sha256"])
-    builder = _pull(_docker_builder(requirements), BASE_BUILDER_IMAGES)
+    tag = _recipe_tag(recipe)
+    builder = _pull(_docker_builder(requirements_payload), BASE_BUILDER_IMAGES)
     builder = builder.run_cmd(_BASE_FINALIZE_COMMAND).set_ready_cmd(_READY_COMMAND)
     build = Template.build(
         builder,
-        template_name,
+        f"{name}:{tag}",
         cpu_count=cpu_count,
         memory_mb=memory_mb,
         on_build_logs=default_build_logger(),
@@ -407,7 +407,7 @@ def build_base_template(
     )
     ref = TemplateRef(
         name=name,
-        tag=f"recipe-{recipe['sha256'][:16]}",
+        tag=tag,
         template_id=build.template_id,
         build_id=build.build_id,
         recipe_sha256=recipe["sha256"],
@@ -439,7 +439,7 @@ def build_ffmpeg_template(
         manifest.write(manifest_path)
         return manifest
 
-    template_name = _tagged_name(name, recipe["sha256"])
+    tag = _recipe_tag(recipe)
     pull_ffmpeg, install_model, inspect_ffmpeg = _ffmpeg_commands()
     builder = (
         Template()
@@ -453,7 +453,7 @@ def build_ffmpeg_template(
     )
     build = Template.build(
         builder,
-        template_name,
+        f"{name}:{tag}",
         cpu_count=manifest.cpu_count,
         memory_mb=manifest.memory_mb,
         on_build_logs=default_build_logger(),
@@ -461,7 +461,7 @@ def build_ffmpeg_template(
     )
     ref = TemplateRef(
         name=name,
-        tag=f"recipe-{recipe['sha256'][:16]}",
+        tag=tag,
         template_id=build.template_id,
         build_id=build.build_id,
         recipe_sha256=recipe["sha256"],

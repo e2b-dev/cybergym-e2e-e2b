@@ -278,7 +278,7 @@ wheels = [
 
 [[package]]
 name = "cybergym-e2e-e2b"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "e2b" },
@@ -296,7 +296,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "e2b", specifier = ">=2.37.0,<2.38" },
+    { name = "e2b", specifier = ">=2.37,<3" },
     { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "tomli-w", specifier = ">=1.2,<2" },
 ]

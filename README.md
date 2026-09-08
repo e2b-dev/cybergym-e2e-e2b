@@ -1,221 +1,166 @@
 # CyberGym-E2E on E2B
 
-This repository is the standalone E2B adapter for
-[CyberGym-E2E](https://github.com/sunblaze-ucb/cybergym-e2e). It runs one source-only
-CyberGym-E2E task in one private E2B sandbox and delegates agent execution and the S1–S4
-validators to the pinned upstream harness. It does not implement the classic binary-only
-CyberGym benchmark.
+`cybergym-e2b` runs [CyberGym-E2E](https://github.com/sunblaze-ucb/cybergym-e2e) tasks on
+[E2B](https://e2b.dev) sandboxes: one fresh Docker-in-Docker sandbox per task, running the
+upstream harness (`run_agent.py`, the S1–S4 validators) unchanged apart from a small
+compatibility patch. It covers the source-only end-to-end mode. The classic binary-only CyberGym
+benchmark is a different project.
 
-The integration pins:
-
-- CyberGym-E2E code commit `b861317f11641b14ab6ba08b5179d0b044601057`;
-- dataset revision `a65d1d273eb7ee5db7525418120fc2434b887203`;
-- the E2B template base image and preloaded OSS-Fuzz images by SHA-256 digest;
-- the Ubuntu package archive at a dated snapshot;
-- every Docker package version and the Docker repository signing-key checksum;
-- every Python template dependency and transitive dependency by version and distribution hash;
-- the FFmpeg project image and Opus model archive by SHA-256 digest.
-
-The pinned upstream inventory contains 920 tasks across 139 projects. The gated dataset is never
-baked into a template. Each sandbox downloads only the data files for its requested task.
-
-## Repository and artifact boundary
-
-This public repository contains the adapter, compatibility patch, runtime helpers, network
-policies, construction locks, and tests. Those assets ship inside the Python wheel, so an installed
-`cybergym-e2b` command does not depend on the current working directory or a source checkout.
-
-The adapter was extracted from E2B's benchmark-conversion work and is maintained here as the
-artifact source of truth. The upstream lock in
-`src/cybergym_e2b/assets/upstream.lock.json` is the executable source of truth for the code and
-dataset inputs used by the extraction. Runtime constants are loaded from that packaged lock rather
-than maintained as duplicate pins.
-The repository intentionally excludes gated dataset contents, API keys, experiment campaigns,
-customer or operator reports, model trajectories, run results, generated template manifests, and
-template build ledgers. Those files are local operational artifacts and are ignored by Git.
-
-## Security and identity contracts
-
-Every runtime project image must use the form `repository@sha256:<64 lowercase hex characters>`.
-Mutable tags are rejected before artifact lookup or sandbox creation. Generate a local lock before
-running a task, either for the tasks you plan to run or for the whole inventory:
-
-```bash
-uv run cybergym-e2b images lock --task curl/arvo_66012   # one task; repeatable, merges
-uv run cybergym-e2b images lock                          # all 506 mutable tags
-```
-
-The command inspects registry manifest descriptors with Docker Buildx; it does not download image
-layers. It records the pinned upstream commit and exact resolver tool/version/method, and
-atomically writes `artifacts/images.lock.json` only after every requested result is an unambiguous
-SHA-256 digest. It also refuses a moved FFmpeg tag that no longer matches the independently pinned
-FFmpeg digest. Docker Hub rate-limits anonymous manifest requests (100 per hour per address at the
-time of writing), so the complete lock needs an authenticated `docker login` with a plan that
-allows it; task-scoped locks stay within the anonymous budget, and the resolver backs off and
-retries briefly on a 429 response. Run, smoke, batch, and preflight consume the lock by default and
-refuse any task whose image is absent from it, as well as stale, extra, mutable, or provenance-free
-maps. Use `--image-lock PATH` to select another generated lock; `--image-map` remains a
-compatibility alias. After Docker pulls or finds an image in the sandbox, the runner verifies that
-the observed repository digests contain the locked digest.
-
-Templates use normal E2B aliases with content-addressed tags such as
-`cybergym-e2e-dind:recipe-0123456789abcdef`. The recipe digest covers the immutable construction
-inputs, upstream revisions, dependency locks, preloaded images, and resource request. A local atomic
-build ledger at `artifacts/templates/build-ledger.json` reuses a tagged template only when the
-complete recipe matches. The generated manifest records the stable tag, immutable E2B template ID,
-immutable build ID, and full recipe digest. Preflight and runtime query E2B and reject the manifest
-if its tag no longer points to the recorded build. Losing the ledger causes a rebuild attempt under
-the same recipe tag; it never reuses an unverified moving tag.
-
-Secrets belong in a local `.env` or another file selected with `CYBERGYM_KEYS_FILE` or
-`--keys-file`. `HF_TOKEN` and the model-provider credential are delivered with E2B request
-transforms: the sandbox receives placeholders while the egress proxy substitutes authorization on
-approved hosts. Public ingress is disabled. The Hugging Face rule is removed before model runtime.
+Supported agents are `codex` and `openhands`, speaking to an OpenAI-compatible endpoint on
+Fireworks or Amazon Bedrock (Mantle). See [Deviations from upstream](#deviations-from-upstream)
+for what this adapter does not reproduce.
 
 ## Prerequisites
 
 - Python 3.12 or 3.13 and [uv](https://docs.astral.sh/uv/)
-- Docker with the Buildx plugin, plus registry credentials for any non-public project images
-- an E2B account with enough template and sandbox capacity
-- accepted access to the gated
-  [CyberGym-E2E dataset](https://huggingface.co/datasets/sunblaze-ucb/cybergym-e2e)
-- `E2B_API_KEY`, `HF_TOKEN`, and a credential for the selected model provider
+- Docker with the Buildx plugin (used only to resolve image tags to digests; nothing is pulled
+  locally)
+- An E2B account with template builds and enough sandbox concurrency for your batch size
+- Accepted access to the gated
+  [sunblaze-ucb/cybergym-e2e](https://huggingface.co/datasets/sunblaze-ucb/cybergym-e2e) dataset
+- Credentials in a local `.env` (copy `.env.example`): `E2B_API_KEY`, `HF_TOKEN`, and either
+  `AWS_MANTLE` (Bedrock) or `FIREWORKS_AI_API_KEY`
 
-Install dependencies and fetch the exact upstream source:
-
-```bash
-uv sync --locked
-uv run cybergym-e2b sync-upstream
-uv run cybergym-e2b inventory
-uv run cybergym-e2b images lock --task curl/arvo_66012
-```
-
-`sync-upstream` refuses to replace a non-Git path or modify a dirty managed checkout. It fetches
-and detaches at the pinned commit under `vendor/cybergym-e2e` by default.
-
-## Build the E2B templates
-
-Build the base template and then the FFmpeg cache-bearing derivative:
-
-```bash
-uv run cybergym-e2b templates build-base \
-  --cpu-count 8 \
-  --memory-mb 8192 \
-  --disk-limit-gb 120
-uv run cybergym-e2b templates build-ffmpeg
-```
-
-Both commands write `artifacts/templates/manifest.json`. The disk value records the expected E2B
-account-tier root-disk allocation; E2B's template build API accepts CPU and memory but does not
-accept a disk-size field. Runtime free-space preflight is authoritative.
-
-The base template contains Docker-in-Docker, the hash-locked Python environment, the sanitizer
-ASLR setting, and both pinned OSS-Fuzz base-builder images. The FFmpeg template adds the pinned
-FFmpeg image and the checksum-verified Opus archive needed during upstream preparation.
-
-## Validate and run
-
-Preflight resolves the same model, network policy, project-aware template route, and immutable task
-image as runtime. It verifies the upstream checkout, selected provider credential, E2B tag-to-build
-receipt, and gated dataset access:
-
-```bash
-uv run cybergym-e2b preflight \
-  --task curl/arvo_66012 \
-  --provider bedrock \
-  --model openai.gpt-5.4
-```
-
-An infrastructure smoke compiles a fresh nested project and runs the upstream ground-truth S4
-validator:
-
-```bash
-uv run cybergym-e2b smoke curl/arvo_66012
-```
-
-Run one source-only agent task. Supported agents are `codex` and `openhands`:
-
-```bash
-uv run cybergym-e2b run curl/arvo_66012 \
-  --agent codex \
-  --provider bedrock \
-  --model openai.gpt-5.4
-```
-
-Codex runs use an explicit `high` reasoning effort by default. This avoids relying on the model
-API's lower implicit default or on Codex metadata inference for provider-specific model IDs. Use
-`--reasoning-effort low|medium|high|xhigh` to make a different comparison configuration explicit;
-the selected value is part of the experiment fingerprint.
-
-Run a bounded batch with an operator-owned task file:
-
-```bash
-uv run cybergym-e2b batch \
-  --kind run \
-  --tasks-file ./local-tasks.txt \
-  --concurrency 4 \
-  --agent codex \
-  --provider bedrock \
-  --model openai.gpt-5.4
-```
-
-The upstream Docker runner does not disable networking, so the comparison-compatible default keeps
-public egress while denying private, loopback, link-local, carrier-grade NAT, and multicast IPv4
-ranges. CyberGym instructs agents that network use invalidates the result. The adapter therefore
-marks default-policy results `requires_network_audit`; inspect trajectories and network evidence
-before including them in a published comparison. `--egress restricted` uses a public dependency
-allowlist and also requires an audit. `--egress permissive` is diagnostic and is always ineligible.
-The packaged `network-locked.json` policy permits only the selected model endpoint during runtime.
-It is eligible without a public-egress audit only once agent tooling (Node, nvm, and Codex) is
-preloaded into the agent container. This release does not ship that preload, so `run`, `batch
---kind run`, and `preflight --kind run` refuse the locked policy before creating a sandbox.
-`smoke` still works under it.
-
-Runtime assets can be overridden with `--patch-file`, `--remote-smoke`,
-`--remote-install-codex`, and `--network-policy`. Overrides are included in the experiment
-fingerprint.
-
-## Execution and result semantics
-
-For each task, the runner:
-
-1. merges the upstream project and task configuration and resolves an immutable runtime image;
-2. selects the base or FFmpeg recipe tag and verifies it still resolves to the manifest's immutable
-   build receipt;
-3. creates a fresh sandbox with kill-on-timeout and automatic resume disabled;
-4. configures bounded swap, Docker, ASLR, and free-space preflight;
-5. uploads only the upstream scripts, compatibility assets, project configuration, and requested
-   task directory;
-6. downloads only the requested gated data and verifies the project-image digest;
-7. replaces setup-only dataset authorization with the runtime model authorization;
-8. runs the upstream agent or smoke workload and collects its outputs; and
-9. kills the sandbox unless `--retain` requests a paused debugging sandbox.
-
-Results are written below `artifacts/e2e/<project>/<task>/<run-id>/result.json`. `completed`
-describes orchestration and artifact collection. `benchmark.status` is separately normalized to
-`passed`, `failed`, or `error`; `benchmark.outcome` distinguishes an exact ground-truth match from
-another valid vulnerability.
-
-Artifact reuse requires an exact experiment fingerprint covering task kind, agent and model
-configuration, verified template build receipt, immutable runtime image, source and dataset revisions,
-compatibility assets, network policy, and runtime options. A model failure with a completed agent
-turn is reusable evidence. Infrastructure errors, interrupted turns, mutable identities, and legacy
-results without the current fingerprint are retried or rejected.
-
-## Development and release checks
+## Quickstart
 
 ```bash
 uv sync --locked
+uv run cybergym-e2b sync-upstream                       # pinned upstream code under vendor/
+uv run cybergym-e2b images lock --task curl/arvo_66012  # pin the task's image to a digest
+
+uv run cybergym-e2b templates build-base                # Docker-in-Docker base template
+uv run cybergym-e2b templates build-ffmpeg              # FFmpeg image + Opus model cache
+
+uv run cybergym-e2b preflight --task curl/arvo_66012 --provider bedrock --model openai.gpt-5.4
+uv run cybergym-e2b smoke curl/arvo_66012               # infra check: ground-truth S4 only
+uv run cybergym-e2b run curl/arvo_66012 --agent codex --provider bedrock --model openai.gpt-5.4
+```
+
+Every command prints one JSON document. Results land under
+`artifacts/e2e/<project>/<task>/<run-id>/`: `result.json` (orchestration, timings, resource
+samples, benchmark verdict) and `sandbox/` (the upstream `agent_output` tree, run log, exit code).
+
+Run many tasks with bounded concurrency. The task file is one `project/task` per line; the
+upstream `scripts/tasks.txt` lists all 920:
+
+```bash
+uv run cybergym-e2b batch --kind run --tasks-file ./my-tasks.txt --concurrency 4 \
+  --agent codex --provider bedrock --model openai.gpt-5.4
+```
+
+`batch` skips tasks that already have a completed result for the exact same experiment
+fingerprint (task, agent, model, template build, image digest, upstream revisions, patch, policy,
+options). A completed run whose agent finished a turn and failed the benchmark counts as done.
+Infrastructure errors and interrupted agent turns are retried. Pass `--no-reuse-completed` to
+rerun everything.
+
+### Image locks and Docker Hub
+
+Upstream references project images by mutable tag. The adapter refuses to run a task until its
+image is pinned to a digest in `artifacts/images.lock.json`. `images lock --task` (repeatable)
+resolves only what you need and merges into the existing lock. `images lock` with no task
+resolves all 506 tags, which exceeds Docker Hub's anonymous manifest budget (about 100 requests
+per hour per address); use it only with an authenticated `docker login`. The lock records the
+resolver tool and version, and the runner verifies the pulled image's digest inside the sandbox.
+
+## How a run works
+
+1. Resolve the task's project and task config from the pinned upstream checkout; select the base
+   template, or the FFmpeg template for any `ffmpeg/*` task.
+2. Verify the template tag still points at the build recorded in `artifacts/templates/manifest.json`.
+3. Create a fresh sandbox (8 vCPU, 8 GB RAM by default, kill on timeout, no auto-resume) with the
+   setup-phase network policy. `HF_TOKEN` is injected by E2B's egress proxy on requests to
+   `huggingface.co` only; the sandbox never holds it.
+4. Set `vm.mmap_rnd_bits=28`, enable 4 GB of swap, check free disk and Docker health.
+5. Upload the upstream scripts (patched), the one project/task directory, and the adapter's
+   helper scripts. Download only that task's data files from Hugging Face. Pull and digest-verify
+   the project image.
+6. Switch to the runtime network policy: the Hugging Face rule is removed and the model provider
+   credential is injected on the provider host only. Extend the sandbox timeout.
+7. Run upstream `run_agent.py` (or the S4 smoke) in the background and poll for its exit code.
+8. Collect `agent_output`, logs, and resource samples; normalize the verdict; kill the sandbox
+   (`--retain` pauses it instead for debugging).
+
+`result.json` separates `completed` (did the adapter finish and collect artifacts) from
+`benchmark.status` (`passed`, `failed`, or `error`) and `benchmark.outcome`
+(`exact_match`, `valid_other_vulnerability`, `failed`, `incomplete_agent_turn`, ...).
+
+## Network policy and result eligibility
+
+The packaged default policy (`--network-policy`, `assets/policies/network.json`) mirrors upstream:
+the agent container has public internet, minus private, loopback, link-local, carrier-grade NAT,
+and multicast IPv4 ranges. CyberGym's prompt tells agents that network use invalidates the
+result, so every default-policy result is marked `requires_network_audit`; inspect the trajectory
+before publishing it.
+
+- `--egress restricted` replaces public egress with an allowlist of the policy's model, dependency,
+  and registry hosts. Results still require an audit.
+- `--egress permissive` removes the adapter's filters entirely, for diagnostics; never eligible.
+- `assets/policies/network-locked.json` allows only the model host at runtime and is eligible
+  without an audit. Because this release installs Node and the agent CLI at runtime, `run` and
+  `batch --kind run` refuse it; `smoke` works under it.
+
+`preflight` reports the eligibility classification for the chosen policy and egress mode.
+
+## Deviations from upstream
+
+The adapter aims to change nothing that affects grading. These are the intentional differences;
+each is either recorded in the experiment fingerprint or documented here.
+
+| Area | Upstream | This adapter |
+|---|---|---|
+| Agents | `claude-code` (default), `codex`, `openhands`, `gemini-cli` | `codex`, `openhands` only |
+| Model access | Anthropic API, Bedrock (SigV4), or a LiteLLM proxy | Direct OpenAI-compatible endpoint (Fireworks, Bedrock Mantle); no LiteLLM |
+| Codex reasoning | Codex default | Explicit `--reasoning-effort high` (configurable), `wire_api = "responses"` |
+| Machine shape | Whatever host runs `run_agent.py` | 8 vCPU, 8 GB RAM, 4 GB swap, shared disk tier; `--cpu-count`/`--memory-mb` at template build |
+| Project images | Mutable tags | Digest-pinned via the image lock |
+| Dataset | Full `hf download` | Per-task `src.tgz`, `poc.bin`, `crash.log` |
+| Agent container setup | `apt-get update && apt-get install sudo git` | `apt`/`apt-get` retry wrapper, a `sudo` shim if absent, dead third-party apt sources disabled before `apt-get update`, hardened Codex installer |
+| Trajectory summary | LLM summary after every failed attempt | Skipped on the final attempt, so that attempt's `feedback_attempt_N.txt` lacks the summary; it only feeds the next attempt |
+| FFmpeg tasks | Fetch the Opus model archive from `media.xiph.org` at prepare time | Checksum-pinned archive baked into the FFmpeg template |
+| Validation dependencies | `apt-get install curl` unconditionally | Skipped when `curl` is already present |
+
+The `apt`/`sudo`/apt-source changes exist because many project images pin apt repositories that
+no longer publish a Release file, which aborts upstream's setup before the agent starts. They
+alter what an agent can install inside its container (a removed Kitware or LLVM source is gone
+for the agent too). Treat results on tasks where the agent depended on such a source with care.
+
+## Pinned inputs
+
+`src/cybergym_e2b/assets/upstream.lock.json` pins the upstream code commit and dataset revision;
+all runtime constants derive from it. Template builds pin the Ubuntu base image and OSS-Fuzz
+builder images by digest, the Ubuntu package archive at a dated snapshot, exact Docker package
+versions and signing-key checksum, and a hash-locked Python environment
+(`assets/template-requirements.lock`). Template tags are content-addressed
+(`cybergym-e2e-dind:recipe-<16 hex>`), and the runner refuses a tag whose E2B build ID no longer
+matches the manifest. Losing `artifacts/templates/build-ledger.json` causes a rebuild under the
+same tag, never reuse of an unverified one.
+
+Runtime assets can be overridden with `--patch-file`, `--remote-smoke`, `--remote-install-codex`,
+and `--network-policy`; overrides change the experiment fingerprint.
+
+## Known limitations
+
+- No Claude Code or Anthropic API path, so upstream's default configuration cannot be reproduced.
+- No plain OpenAI provider; only Fireworks and Bedrock Mantle hosts are declared in the policies.
+- The full 506-image lock needs an authenticated Docker Hub session.
+- 8 GB RAM plus 4 GB swap has been validated on a sample of tasks, not the whole inventory.
+  Watch `observed_resources.minimum_memory_available_bytes` and swap usage in `result.json`.
+- E2B's template build API does not take a disk size; the recorded `--disk-limit-gb` is the
+  expected account tier, and the runtime free-space check is what actually protects a run.
+- Remaining engineering follow-ups are tracked in [FOLLOW-UPS.md](FOLLOW-UPS.md).
+
+## Development
+
+```bash
+uv sync --locked
+uv run cybergym-e2b sync-upstream     # several tests read the vendored checkout
 uv run pytest -q
-uv run ruff check .
-uv run ruff format --check .
+uv run ruff check . && uv run ruff format --check .
 uv run python scripts/check_public_tree.py
-actionlint .github/workflows/ci.yml
-uv build --no-build-isolation --clear
-uv run twine check dist/*
+uv build --no-build-isolation --clear && uv run twine check dist/*
 ```
 
-CI runs tests on Python 3.12 and 3.13, checks the public tree, verifies the installed wheel outside
-the checkout, and reruns the suite from the extracted source distribution.
-
-Security reports follow [SECURITY.md](SECURITY.md). The project is licensed under Apache-2.0.
+CI runs the suite on Python 3.12 and 3.13, installs the wheel outside the checkout, and reruns
+the tests from the extracted source distribution. Security reports follow
+[SECURITY.md](SECURITY.md). Licensed under Apache-2.0.

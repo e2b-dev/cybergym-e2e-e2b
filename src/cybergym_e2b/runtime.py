@@ -44,7 +44,6 @@ from cybergym_e2b.inventory import (
     ResolvedTask,
     build_code_bundle,
     require_immutable_runtime_image,
-    resolved_asdict,
 )
 from cybergym_e2b.templates import verify_template_ref
 
@@ -52,6 +51,12 @@ EgressMode = Literal["policy", "restricted", "permissive"]
 Agent = Literal["codex", "openhands"]
 ModelProvider = Literal["fireworks", "bedrock"]
 ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
+
+# Wall-clock kept back from the evaluation timeout so a workload that runs to the deadline
+# still leaves time to read metrics and download the trajectory before E2B kills the sandbox.
+COLLECTION_RESERVE_SECONDS = 600
+# Consecutive failed polls (10 s apart) before a workload is declared unreachable.
+_MAX_CONSECUTIVE_POLL_FAILURES = 12
 
 
 @dataclass(frozen=True)
@@ -178,18 +183,21 @@ def _policy(path: Path) -> dict[str, Any]:
 
 
 def _resolve_non_http(policy: dict[str, Any], project: str) -> list[dict]:
+    """Resolve the policy's non-HTTP hosts for one project to IPv4 allowlist entries."""
     resolved: list[dict] = []
     for entry in policy["non_http_hosts"]:
         if project not in entry["projects"]:
             continue
-        addresses = sorted(
-            {
-                item[4][0]
-                for item in socket.getaddrinfo(
-                    entry["host"], entry["port"], family=socket.AF_INET, type=socket.SOCK_STREAM
-                )
-            }
-        )
+        try:
+            infos = socket.getaddrinfo(
+                entry["host"], entry["port"], family=socket.AF_INET, type=socket.SOCK_STREAM
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not resolve non-HTTP egress host {entry['host']} for project "
+                f"{project}: {exc}"
+            ) from exc
+        addresses = sorted({item[4][0] for item in infos})
         if not addresses:
             raise RuntimeError(f"could not resolve non-HTTP egress host {entry['host']}")
         resolved.append({**entry, "addresses": addresses})
@@ -232,7 +240,7 @@ def _agent_model_id(options: RunOptions) -> str:
 
 
 def _transforms(
-    *, hf_token: str | None, model_key: str | None, model_host: str = "api.fireworks.ai"
+    *, hf_token: str | None, model_key: str | None, model_host: str
 ) -> dict[str, list[dict]]:
     rules: dict[str, list[dict]] = {}
     if hf_token:
@@ -244,6 +252,13 @@ def _transforms(
     return rules
 
 
+def _enforces_allowlist(policy: dict[str, Any], egress: EgressMode) -> bool:
+    """Whether sandbox egress is a host allowlist (True) or public traffic with a deny list."""
+    if egress == "permissive":
+        return False
+    return not (egress == "policy" and policy["default_action"] == "allow")
+
+
 def _network(
     policy: dict[str, Any],
     *,
@@ -252,7 +267,7 @@ def _network(
     hf_token: str | None,
     model_key: str | None,
     non_http: list[dict],
-    model_host: str = "api.fireworks.ai",
+    model_host: str,
 ) -> dict[str, Any]:
     # Dataset credentials exist only while preparing the task. The model credential
     # exists only while running the workload. Keeping these phases mutually exclusive
@@ -265,7 +280,7 @@ def _network(
     network: dict[str, Any] = {"allow_public_traffic": False, "rules": rules}
     if egress == "permissive":
         return network
-    if egress == "policy" and policy["default_action"] == "allow":
+    if not _enforces_allowlist(policy, egress):
         network["deny_out"] = sorted(set(policy["deny_out"]))
         return network
     non_http_addresses = [address for entry in non_http for address in entry["addresses"]]
@@ -283,9 +298,7 @@ def _require_runnable_policy(
     policy: dict[str, Any], *, kind: Literal["smoke", "run"], egress: EgressMode
 ) -> None:
     """Agent runs install Node and the agent CLI at runtime; a model-only allowlist cannot."""
-    if kind != "run" or egress == "permissive":
-        return
-    if egress == "policy" and policy["default_action"] == "allow":
+    if kind != "run" or not _enforces_allowlist(policy, egress):
         return
     if not policy["runtime_dependency_hosts"]:
         raise ValueError(
@@ -302,7 +315,7 @@ def _network_eligibility(policy: dict[str, Any], egress: EgressMode) -> dict[str
             "status": "ineligible",
             "reasons": ["permissive diagnostic egress is not benchmark eligible"],
         }
-    if egress == "policy" and policy["default_action"] == "allow":
+    if not _enforces_allowlist(policy, egress):
         return {
             "status": "requires_network_audit",
             "reasons": ["runtime policy permits public egress"],
@@ -361,7 +374,7 @@ def _experiment_identity(
     template = _route_template(manifest, project=resolved.project, build_image=resolved.build_image)
     payload = {
         "kind": kind,
-        "task": resolved_asdict(resolved),
+        "task": asdict(resolved),
         "options": asdict(options),
         "template": {
             "reference": template.reference,
@@ -565,13 +578,9 @@ print(json.dumps({{
 }}))
 """.strip()
     started = time.monotonic()
-    info = _run_json(
-        sandbox,
-        f"python3 -c {shlex.quote(code)}",
-        timeout=timeout,
-    )
+    info = _run_json(sandbox, f"python3 -c {shlex.quote(code)}", timeout=timeout)
     info["pull_or_verify_seconds"] = round(time.monotonic() - started, 6)
-    return {key: value for key, value in info.items()}
+    return info
 
 
 def _assert_image_identity(runtime_image: str, metadata: dict) -> None:
@@ -610,6 +619,11 @@ def _execution_context(
 ) -> ExecutionContext:
     """Resolve the exact template, model, and network inputs used by preflight and runtime."""
     require_immutable_runtime_image(resolved)
+    if options.evaluation_timeout <= COLLECTION_RESERVE_SECONDS:
+        raise ValueError(
+            f"evaluation_timeout must exceed {COLLECTION_RESERVE_SECONDS} seconds so results "
+            "can be collected before the sandbox is killed"
+        )
     manifest = TemplateManifest.load(manifest_path)
     template = _route_template(
         manifest,
@@ -618,11 +632,17 @@ def _execution_context(
     )
     policy = _policy(network_policy_path)
     _require_runnable_policy(policy, kind=kind, egress=options.egress)
+    # Non-HTTP addresses only matter for an allowlist; skip host-side DNS otherwise.
+    non_http = (
+        _resolve_non_http(policy, resolved.project)
+        if _enforces_allowlist(policy, options.egress)
+        else []
+    )
     return ExecutionContext(
         manifest=manifest,
         template=template,
         policy=policy,
-        non_http=_resolve_non_http(policy, resolved.project),
+        non_http=non_http,
         model_config=_model_config(options),
     )
 
@@ -684,6 +704,7 @@ def _shell_run(sandbox: Sandbox, command: str, *, timeout: int) -> int:
 
     deadline = time.monotonic() + timeout
     poll_error: Exception | None = None
+    consecutive_failures = 0
     while time.monotonic() < deadline:
         try:
             result = sandbox.commands.run(f"test ! -f {exit_path} || cat {exit_path}", timeout=30)
@@ -691,8 +712,15 @@ def _shell_run(sandbox: Sandbox, command: str, *, timeout: int) -> int:
             if payload:
                 return int(payload)
             poll_error = None
+            consecutive_failures = 0
         except Exception as exc:
             poll_error = exc
+            consecutive_failures += 1
+            # A killed or hung sandbox must not pin a worker until the full deadline.
+            if consecutive_failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                raise RuntimeError(
+                    f"sandbox stopped answering after {consecutive_failures} consecutive polls"
+                ) from exc
         time.sleep(10)
     detail = f"; last poll error: {poll_error}" if poll_error else ""
     raise TimeoutError(f"workload did not finish within {timeout} seconds{detail}")
@@ -798,55 +826,54 @@ while True:
     )
 
 
+_COUNTER_FIELDS = (
+    "network_receive_bytes",
+    "network_transmit_bytes",
+    "block_read_bytes",
+    "block_write_bytes",
+    "block_io_milliseconds",
+    "page_faults",
+    "major_page_faults",
+    "swap_in_pages",
+    "swap_out_pages",
+)
+
+
 def _resource_summary(sandbox: Sandbox) -> dict:
+    """Summarize the 1 Hz samples written by the in-sandbox resource monitor."""
     path = "/opt/cybergym-e2e/e2b-resource-samples.jsonl"
     try:
-        payload = sandbox.files.read(path)
+        payload = str(sandbox.files.read(path))
     except Exception:
         return {"sample_count": 0}
-    samples = [json.loads(line) for line in str(payload).splitlines() if line.strip()]
+    samples = []
+    for line in payload.splitlines():
+        try:
+            samples.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a line truncated by the monitor being killed mid-write
     if not samples:
         return {"sample_count": 0}
-    summary = {
+    first, last = samples[0], samples[-1]
+    summary: dict[str, Any] = {
         "sample_count": len(samples),
-        "interval_seconds": 1 if all("cpu_total_ticks" in item for item in samples) else 5,
+        "interval_seconds": 1,
         "disk_total_bytes": max(item["disk_total_bytes"] for item in samples),
         "peak_disk_used_bytes": max(item["disk_used_bytes"] for item in samples),
         "minimum_disk_free_bytes": min(item["disk_free_bytes"] for item in samples),
         "memory_total_bytes": max(item["memory_total_bytes"] for item in samples),
         "minimum_memory_available_bytes": min(item["memory_available_bytes"] for item in samples),
+        "swap_total_bytes": max(item["swap_total_bytes"] for item in samples),
+        "peak_swap_used_bytes": max(item["swap_used_bytes"] for item in samples),
+        "minimum_swap_free_bytes": min(item["swap_free_bytes"] for item in samples),
+        "peak_load_1m": max(item["load_1m"] for item in samples),
     }
-    if all("swap_total_bytes" in item for item in samples):
-        summary.update(
-            {
-                "swap_total_bytes": max(item["swap_total_bytes"] for item in samples),
-                "peak_swap_used_bytes": max(item["swap_used_bytes"] for item in samples),
-                "minimum_swap_free_bytes": min(item["swap_free_bytes"] for item in samples),
-            }
-        )
-    first = samples[0]
-    last = samples[-1]
-    counter_fields = {
-        "network_receive_bytes": "network_receive_bytes",
-        "network_transmit_bytes": "network_transmit_bytes",
-        "block_read_bytes": "block_read_bytes",
-        "block_write_bytes": "block_write_bytes",
-        "block_io_milliseconds": "block_io_milliseconds",
-        "page_faults": "page_faults",
-        "major_page_faults": "major_page_faults",
-        "swap_in_pages": "swap_in_pages",
-        "swap_out_pages": "swap_out_pages",
-    }
-    for source, destination in counter_fields.items():
-        if source in first and source in last:
-            summary[f"delta_{destination}"] = max(0, last[source] - first[source])
-    if all("load_1m" in item for item in samples):
-        summary["peak_load_1m"] = max(item["load_1m"] for item in samples)
-    if all("cpu_total_ticks" in item and "cpu_idle_ticks" in item for item in samples):
-        total = last["cpu_total_ticks"] - first["cpu_total_ticks"]
-        idle = last["cpu_idle_ticks"] - first["cpu_idle_ticks"]
-        if total > 0:
-            summary["average_cpu_busy_percent"] = round(100 * (total - idle) / total, 3)
+    for field in _COUNTER_FIELDS:
+        summary[f"delta_{field}"] = max(0, last[field] - first[field])
+    total = last["cpu_total_ticks"] - first["cpu_total_ticks"]
+    idle = last["cpu_idle_ticks"] - first["cpu_idle_ticks"]
+    if total > 0:
+        summary["average_cpu_busy_percent"] = round(100 * (total - idle) / total, 3)
     return summary
 
 
@@ -1042,14 +1069,38 @@ def _finalize(sandbox: Sandbox, retain: bool, result: dict) -> None:
     result["cleanup_error"] = f"{type(cleanup_error).__name__}: {cleanup_error}"
 
 
-def _stop_resource_monitor(monitor: Any, result: dict, *, stage: str) -> None:
-    """Best-effort monitor cleanup that cannot suppress run finalization."""
-    try:
-        monitor.kill()
-    except Exception as exc:
-        result.setdefault("monitor_errors", []).append(
-            {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
-        )
+def _observe_after_workload(
+    sandbox: Sandbox,
+    result: dict,
+    profiler: _StageProfiler,
+    monitor: Any | None,
+    *,
+    suffix: str = "",
+) -> None:
+    """Stop the monitor and snapshot resources and disk state without ever raising.
+
+    Runs once per task, after the workload finished or failed. A malformed sample or a
+    flaky metrics command must not stop the trajectory from being collected.
+    """
+    if monitor is not None:
+        with profiler.stage(f"resource_monitor_stop{suffix}"):
+            try:
+                monitor.kill()
+            except Exception as exc:
+                result.setdefault("observation_errors", []).append(
+                    {"step": "monitor_stop", "type": type(exc).__name__, "message": str(exc)}
+                )
+    for step, key, observe in (
+        ("resource_summary", "observed_resources", _resource_summary),
+        ("post_workload_metrics", f"post_workload{suffix}", _disk_and_docker),
+    ):
+        try:
+            with profiler.stage(f"{step}{suffix}"):
+                result[key] = observe(sandbox)
+        except Exception as exc:
+            result.setdefault("observation_errors", []).append(
+                {"step": step, "type": type(exc).__name__, "message": str(exc)}
+            )
 
 
 def execute_task(
@@ -1123,7 +1174,7 @@ def execute_task(
         "kind": kind,
         "run_id": run_id,
         "batch_id": batch_id,
-        "task": resolved_asdict(resolved),
+        "task": asdict(resolved),
         "template": template.reference,
         "template_receipt": {**template_receipt, "recipe_sha256": template.recipe_sha256},
         "experiment": experiment,
@@ -1203,11 +1254,12 @@ def execute_task(
         )
         _assert_preflight(before, minimum)
         result["preflight"] = before
-        with profiler.stage("resource_monitor_start"):
-            resource_monitor = _start_resource_monitor(sandbox)
         stage = "upload_code_bundle"
         with profiler.stage("code_bundle_upload"):
             result["code_bundle"] = _upload_bundle(sandbox, bundle)
+        # The upload recreates /opt/cybergym-e2e, so the monitor must start after it.
+        with profiler.stage("resource_monitor_start"):
+            resource_monitor = _start_resource_monitor(sandbox)
         stage = "download_hf_task_data"
         with profiler.stage("task_data_download") as data_stage:
             result["task_data"] = _download_task_data(
@@ -1266,17 +1318,13 @@ def execute_task(
         try:
             with profiler.stage("workload"):
                 result["workload_exit_code"] = _shell_run(
-                    sandbox, command, timeout=options.evaluation_timeout - 120
+                    sandbox,
+                    command,
+                    timeout=options.evaluation_timeout - COLLECTION_RESERVE_SECONDS,
                 )
         finally:
-            if resource_monitor is not None:
-                with profiler.stage("resource_monitor_stop"):
-                    _stop_resource_monitor(resource_monitor, result, stage="after_workload")
-                resource_monitor = None
-            with profiler.stage("resource_summary"):
-                result["observed_resources"] = _resource_summary(sandbox)
-            with profiler.stage("post_workload_metrics"):
-                result["post_workload"] = _disk_and_docker(sandbox)
+            _observe_after_workload(sandbox, result, profiler, resource_monitor)
+            resource_monitor = None
         stage = "collect"
         with profiler.stage("artifact_collect"):
             _collect(sandbox, output)
@@ -1287,17 +1335,11 @@ def execute_task(
         result["completed"] = False
         result["error"] = {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
         if sandbox is not None:
-            if resource_monitor is not None:
-                with profiler.stage("resource_monitor_stop_after_failure"):
-                    _stop_resource_monitor(resource_monitor, result, stage="after_failure")
+            if "observed_resources" not in result:
+                _observe_after_workload(
+                    sandbox, result, profiler, resource_monitor, suffix="_after_failure"
+                )
                 resource_monitor = None
-            with profiler.stage("resource_summary_after_failure"):
-                result["observed_resources"] = _resource_summary(sandbox)
-            try:
-                with profiler.stage("post_failure_metrics"):
-                    result["post_failure"] = _disk_and_docker(sandbox)
-            except Exception as metrics_exc:
-                result["metrics_error"] = f"{type(metrics_exc).__name__}: {metrics_exc}"
             try:
                 with profiler.stage("artifact_collect_after_failure"):
                     _collect(sandbox, output)
@@ -1305,9 +1347,6 @@ def execute_task(
                 result["collection_error"] = f"{type(collect_exc).__name__}: {collect_exc}"
     finally:
         if sandbox is not None:
-            if resource_monitor is not None:
-                with profiler.stage("resource_monitor_stop_finally"):
-                    _stop_resource_monitor(resource_monitor, result, stage="finalize")
             with profiler.stage("sandbox_finalize"):
                 _finalize(sandbox, options.retain, result)
         result["profile"] = profiler.result()

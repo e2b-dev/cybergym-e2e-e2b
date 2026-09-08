@@ -257,7 +257,7 @@ def test_cli_exposes_image_lock_and_uses_it_by_default() -> None:
 
     assert lock_args.output == DEFAULT_IMAGE_LOCK
     assert lock_args.tasks == []
-    assert run_args.image_map == DEFAULT_IMAGE_LOCK
+    assert run_args.image_lock == DEFAULT_IMAGE_LOCK
 
     scoped = _parser().parse_args(["images", "lock", "--task", "curl/arvo_66012", "--task", "a/b"])
     assert scoped.tasks == ["curl/arvo_66012", "a/b"]
