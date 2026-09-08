@@ -84,7 +84,8 @@ def load_image_map(path: Path | None, *, upstream: Path | None = None) -> dict[s
     if path is None:
         if upstream is not None:
             raise FileNotFoundError(
-                "a complete image lock is required; run `cybergym-e2b images lock`"
+                "an image lock is required; run `cybergym-e2b images lock` "
+                "or `cybergym-e2b images lock --task <project>/<task>`"
             )
         return {}
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -116,15 +117,9 @@ def load_image_map(path: Path | None, *, upstream: Path | None = None) -> dict[s
         ):
             raise ValueError("image-map value for FFmpeg must preserve the known FFmpeg digest")
     if upstream is not None:
+        # A lock may cover a subset of the inventory; each task is checked at resolution.
         required = set(mutable_project_images(upstream))
-        actual = set(images)
-        missing = sorted(required - actual)
-        unexpected = sorted(actual - required)
-        if missing:
-            raise ValueError(
-                f"image lock is incomplete: missing {len(missing)} mutable project image(s); "
-                f"first missing image: {missing[0]}"
-            )
+        unexpected = sorted(set(images) - required)
         if unexpected:
             raise ValueError(
                 f"image lock has {len(unexpected)} image(s) absent from the pinned inventory; "
@@ -135,10 +130,12 @@ def load_image_map(path: Path | None, *, upstream: Path | None = None) -> dict[s
 
 def require_immutable_runtime_image(resolved: ResolvedTask) -> None:
     """Fail before artifact reuse or sandbox creation on a mutable project image."""
-    require_digest_locked_image(
-        resolved.runtime_image,
-        label=f"runtime image for CyberGym-E2E task {resolved.task}",
-    )
+    if not is_digest_locked_image(resolved.runtime_image):
+        raise ValueError(
+            f"runtime image for CyberGym-E2E task {resolved.task} is not digest-locked "
+            f"(absent from the image lock): {resolved.runtime_image!r}; "
+            f"run `cybergym-e2b images lock --task {resolved.task}`"
+        )
 
 
 def inventory(upstream: Path) -> dict:
