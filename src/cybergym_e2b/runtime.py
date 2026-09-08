@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -48,6 +49,7 @@ from cybergym_e2b.inventory import (
 from cybergym_e2b.templates import verify_template_ref
 
 EgressMode = Literal["policy", "restricted", "permissive"]
+Agent = Literal["codex", "openhands"]
 ModelProvider = Literal["fireworks", "bedrock"]
 ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 
@@ -61,7 +63,7 @@ class RunOptions:
     swap_gb: int = 4
     egress: EgressMode = "policy"
     retain: bool = False
-    agent: str = "codex"
+    agent: Agent = "codex"
     prompt_style: str = "iterative"
     model: str = DEFAULT_MODEL
     reasoning_effort: ReasoningEffort = "high"
@@ -208,8 +210,7 @@ def _model_config(options: RunOptions) -> dict[str, str | None]:
         host = f"bedrock-mantle.{options.bedrock_region}.api.aws"
         # Bedrock exposes OpenAI frontier models through its OpenAI-specific
         # Responses route. Other Mantle models (including DeepSeek V3.2) use the
-        # general OpenAI-compatible route consumed by OpenHands/Gemini via Chat
-        # Completions.
+        # general OpenAI-compatible route consumed by OpenHands via Chat Completions.
         api_prefix = "openai/v1" if options.agent == "codex" else "v1"
         return {
             "host": host,
@@ -268,7 +269,7 @@ def _network(
         network["deny_out"] = sorted(set(policy["deny_out"]))
         return network
     non_http_addresses = [address for entry in non_http for address in entry["addresses"]]
-    if model_host not in policy["model_hosts"]:
+    if not any(fnmatch.fnmatchcase(model_host, pattern) for pattern in policy["model_hosts"]):
         raise ValueError(f"model host {model_host!r} is not declared by the network policy")
     runtime_hosts = policy["runtime_dependency_hosts"] + [model_host] + non_http_addresses
     hosts = runtime_hosts
@@ -276,6 +277,22 @@ def _network(
         hosts = runtime_hosts + policy["artifact_hosts"] + policy["registry_hosts"]
     network.update({"deny_out": ["0.0.0.0/0"], "allow_out": sorted(set(hosts))})
     return network
+
+
+def _require_runnable_policy(
+    policy: dict[str, Any], *, kind: Literal["smoke", "run"], egress: EgressMode
+) -> None:
+    """Agent runs install Node and the agent CLI at runtime; a model-only allowlist cannot."""
+    if kind != "run" or egress == "permissive":
+        return
+    if egress == "policy" and policy["default_action"] == "allow":
+        return
+    if not policy["runtime_dependency_hosts"]:
+        raise ValueError(
+            "network policy permits only the model host at runtime, but agent runs install "
+            "agent tooling (nvm, Node, Codex) inside the task container; preload that tooling "
+            "or use a policy that declares runtime_dependency_hosts"
+        )
 
 
 def _network_eligibility(policy: dict[str, Any], egress: EgressMode) -> dict[str, Any]:
@@ -586,6 +603,7 @@ def _route_template(manifest: TemplateManifest, *, project: str, build_image: st
 def _execution_context(
     resolved: ResolvedTask,
     *,
+    kind: Literal["smoke", "run"],
     options: RunOptions,
     manifest_path: Path,
     network_policy_path: Path,
@@ -599,6 +617,7 @@ def _execution_context(
         build_image=resolved.build_image,
     )
     policy = _policy(network_policy_path)
+    _require_runnable_policy(policy, kind=kind, egress=options.egress)
     return ExecutionContext(
         manifest=manifest,
         template=template,
@@ -846,12 +865,27 @@ def _collect(sandbox: Sandbox, destination: Path) -> None:
     payload = bytes(sandbox.files.read("/tmp/cybergym-e2e-results.tgz", format="bytes"))
     archive_path = destination / "sandbox-results.tgz"
     archive_path.write_bytes(payload)
+    _extract_results(archive_path, destination / "sandbox")
+
+
+def _result_member_filter(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo | None:
+    # Keep in-tree links (cp -a plus tar emits hardlinks) but drop any member the data
+    # filter rejects, so a stray agent symlink to an outside path cannot escape the
+    # artifact root or fail collection of an otherwise complete run.
+    try:
+        return tarfile.data_filter(member, path)
+    except tarfile.FilterError:
+        return None
+
+
+def _extract_results(archive_path: Path, root: Path) -> None:
+    root_resolved = root.resolve()
     with tarfile.open(archive_path, mode="r:gz") as archive:
         for member in archive.getmembers():
-            target = (destination / "sandbox").resolve() / member.name
-            if not target.is_relative_to((destination / "sandbox").resolve()):
+            target = Path(os.path.normpath(root_resolved / member.name))
+            if not target.is_relative_to(root_resolved):
                 raise RuntimeError("unsafe path in sandbox result archive")
-        archive.extractall(destination / "sandbox", filter="data")
+        archive.extractall(root, filter=_result_member_filter)
 
 
 def _codex_turn_state(destination: Path) -> dict[str, Any]:
@@ -1036,6 +1070,7 @@ def execute_task(
 ) -> dict:
     context = _execution_context(
         resolved,
+        kind=kind,
         options=options,
         manifest_path=manifest_path,
         network_policy_path=network_policy_path,

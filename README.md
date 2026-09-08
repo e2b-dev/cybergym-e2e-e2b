@@ -37,22 +37,26 @@ template build ledgers. Those files are local operational artifacts and are igno
 ## Security and identity contracts
 
 Every runtime project image must use the form `repository@sha256:<64 lowercase hex characters>`.
-Mutable tags are rejected before artifact lookup or sandbox creation. Generate the complete local
-lock for the pinned inventory before running any task:
+Mutable tags are rejected before artifact lookup or sandbox creation. Generate a local lock before
+running a task, either for the tasks you plan to run or for the whole inventory:
 
 ```bash
-uv run cybergym-e2b images lock
+uv run cybergym-e2b images lock --task curl/arvo_66012   # one task; repeatable, merges
+uv run cybergym-e2b images lock                          # all 506 mutable tags
 ```
 
 The command inspects registry manifest descriptors with Docker Buildx; it does not download image
-layers. It resolves all 506 unique mutable project-image tags, records the pinned upstream commit
-and exact resolver tool/version/method, and atomically writes `artifacts/images.lock.json` only
-after every result is an unambiguous SHA-256 digest. It also refuses a moved FFmpeg tag that no
-longer matches the independently pinned FFmpeg digest. Run, smoke, batch, and preflight consume
-this lock by default and reject missing, partial, stale, extra, mutable, or provenance-free maps.
-Use `--image-lock PATH` to select another generated lock; `--image-map` remains a compatibility
-alias. After Docker pulls or finds an image in the sandbox, the runner verifies that the observed
-repository digests contain the locked digest.
+layers. It records the pinned upstream commit and exact resolver tool/version/method, and
+atomically writes `artifacts/images.lock.json` only after every requested result is an unambiguous
+SHA-256 digest. It also refuses a moved FFmpeg tag that no longer matches the independently pinned
+FFmpeg digest. Docker Hub rate-limits anonymous manifest requests (100 per hour per address at the
+time of writing), so the complete lock needs an authenticated `docker login` with a plan that
+allows it; task-scoped locks stay within the anonymous budget, and the resolver backs off and
+retries briefly on a 429 response. Run, smoke, batch, and preflight consume the lock by default and
+refuse any task whose image is absent from it, as well as stale, extra, mutable, or provenance-free
+maps. Use `--image-lock PATH` to select another generated lock; `--image-map` remains a
+compatibility alias. After Docker pulls or finds an image in the sandbox, the runner verifies that
+the observed repository digests contain the locked digest.
 
 Templates use normal E2B aliases with content-addressed tags such as
 `cybergym-e2e-dind:recipe-0123456789abcdef`. The recipe digest covers the immutable construction
@@ -83,7 +87,7 @@ Install dependencies and fetch the exact upstream source:
 uv sync --locked
 uv run cybergym-e2b sync-upstream
 uv run cybergym-e2b inventory
-uv run cybergym-e2b images lock
+uv run cybergym-e2b images lock --task curl/arvo_66012
 ```
 
 `sync-upstream` refuses to replace a non-Git path or modify a dirty managed checkout. It fetches
@@ -129,7 +133,7 @@ validator:
 uv run cybergym-e2b smoke curl/arvo_66012
 ```
 
-Run one source-only agent task:
+Run one source-only agent task. Supported agents are `codex` and `openhands`:
 
 ```bash
 uv run cybergym-e2b run curl/arvo_66012 \
@@ -161,8 +165,11 @@ ranges. CyberGym instructs agents that network use invalidates the result. The a
 marks default-policy results `requires_network_audit`; inspect trajectories and network evidence
 before including them in a published comparison. `--egress restricted` uses a public dependency
 allowlist and also requires an audit. `--egress permissive` is diagnostic and is always ineligible.
-The packaged `network-locked.json` policy permits only the selected model endpoint during runtime
-and is eligible without a public-egress audit after all task dependencies have been preloaded.
+The packaged `network-locked.json` policy permits only the selected model endpoint during runtime.
+It is eligible without a public-egress audit only once agent tooling (Node, nvm, and Codex) is
+preloaded into the agent container. This release does not ship that preload, so `run`, `batch
+--kind run`, and `preflight --kind run` refuse the locked policy before creating a sandbox.
+`smoke` still works under it.
 
 Runtime assets can be overridden with `--patch-file`, `--remote-smoke`,
 `--remote-install-codex`, and `--network-policy`. Overrides are included in the experiment
