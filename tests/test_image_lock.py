@@ -13,8 +13,8 @@ from cybergym_e2b.config import (
     UPSTREAM_COMMIT,
     UPSTREAM_REPOSITORY,
 )
-from cybergym_e2b.images import DockerBuildxResolver, create_image_lock
-from cybergym_e2b.inventory import load_image_map
+from cybergym_e2b.images import DockerBuildxResolver, create_image_lock, write_image_lock
+from cybergym_e2b.inventory import load_image_map, require_immutable_runtime_image, resolve_task
 
 
 def _write_project(
@@ -101,10 +101,80 @@ def test_image_lock_is_deterministic_complete_and_records_provenance(tmp_path: P
     lock_path.write_text(json.dumps(first), encoding="utf-8")
     assert load_image_map(lock_path, upstream=upstream) == first["images"]
 
+    # A partial lock is usable for the tasks it covers and refused for the rest.
     del first["images"]["registry.example/beta:v2"]
     lock_path.write_text(json.dumps(first), encoding="utf-8")
-    with pytest.raises(ValueError, match="incomplete"):
+    partial = load_image_map(lock_path, upstream=upstream)
+    covered = resolve_task(upstream, "alpha/task-a", image_map=partial)
+    require_immutable_runtime_image(covered)
+    assert covered.runtime_image == "registry.example/alpha@sha256:" + "a" * 64
+    with pytest.raises(ValueError, match="images lock --task beta/task-c"):
+        require_immutable_runtime_image(resolve_task(upstream, "beta/task-c", image_map=partial))
+
+    first["images"]["registry.example/stranger:v9"] = "registry.example/stranger@sha256:" + "e" * 64
+    lock_path.write_text(json.dumps(first), encoding="utf-8")
+    with pytest.raises(ValueError, match="absent from the pinned inventory"):
         load_image_map(lock_path, upstream=upstream)
+
+
+def test_image_lock_can_be_scoped_to_tasks_and_merged(tmp_path: Path) -> None:
+    upstream = tmp_path / "upstream"
+    _write_project(upstream, "alpha", "task-a", "registry.example/alpha:v1")
+    _write_project(upstream, "beta", "task-c", "registry.example/beta:v2")
+    resolved = {
+        "registry.example/alpha:v1": "registry.example/alpha@sha256:" + "a" * 64,
+        "registry.example/beta:v2": "registry.example/beta@sha256:" + "b" * 64,
+    }
+
+    resolver = _Resolver(resolved)
+    scoped = create_image_lock(upstream, resolver=resolver, tasks=["alpha/task-a"])
+    assert set(scoped["images"]) == {"registry.example/alpha:v1"}
+    assert resolver.calls == ["registry.example/alpha:v1"]
+
+    # Repeated scoped runs accumulate into one lock, so a rate-limited registry can
+    # be walked in slices without ever re-resolving what is already pinned.
+    output = tmp_path / "images.lock.json"
+    write_image_lock(upstream, output, resolver=_Resolver(resolved), tasks=["alpha/task-a"])
+    second = _Resolver(resolved)
+    merged = write_image_lock(upstream, output, resolver=second, tasks=["beta/task-c"])
+    assert second.calls == ["registry.example/beta:v2"]
+    assert merged["images"] == resolved
+    assert json.loads(output.read_text())["images"] == resolved
+
+
+def test_docker_buildx_resolver_retries_rate_limited_inspections() -> None:
+    attempts: list[str] = []
+    sleeps: list[float] = []
+
+    def runner(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "version":
+            return subprocess.CompletedProcess(command, 0, "buildx 1.0\n", "")
+        attempts.append(command[4])
+        if len(attempts) < 3:
+            raise subprocess.CalledProcessError(
+                1,
+                command,
+                stderr="ERROR: unexpected status from HEAD request: 429 Too Many Requests",
+            )
+        return subprocess.CompletedProcess(
+            command, 0, json.dumps({"digest": "sha256:" + "a" * 64}), ""
+        )
+
+    resolver = DockerBuildxResolver(runner=runner, sleep=sleeps.append)
+    assert resolver("registry.example/app:v1") == "registry.example/app@sha256:" + "a" * 64
+    assert len(attempts) == 3
+    assert len(sleeps) == 2
+
+
+def test_docker_buildx_resolver_surfaces_registry_error_text() -> None:
+    def runner(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "version":
+            return subprocess.CompletedProcess(command, 0, "buildx 1.0\n", "")
+        raise subprocess.CalledProcessError(1, command, stderr="ERROR: manifest unknown")
+
+    resolver = DockerBuildxResolver(runner=runner, sleep=lambda _seconds: None)
+    with pytest.raises(RuntimeError, match="manifest unknown"):
+        resolver("registry.example/app:v1")
 
 
 def test_docker_buildx_resolver_uses_manifest_descriptor_without_pulling_layers() -> None:
@@ -186,4 +256,8 @@ def test_cli_exposes_image_lock_and_uses_it_by_default() -> None:
     run_args = _parser().parse_args(["run", "curl/arvo_66012"])
 
     assert lock_args.output == DEFAULT_IMAGE_LOCK
-    assert run_args.image_map == DEFAULT_IMAGE_LOCK
+    assert lock_args.tasks == []
+    assert run_args.image_lock == DEFAULT_IMAGE_LOCK
+
+    scoped = _parser().parse_args(["images", "lock", "--task", "curl/arvo_66012", "--task", "a/b"])
+    assert scoped.tasks == ["curl/arvo_66012", "a/b"]

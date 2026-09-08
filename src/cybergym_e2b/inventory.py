@@ -8,7 +8,7 @@ import tarfile
 import tempfile
 import tomllib
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import tomli_w
@@ -80,65 +80,56 @@ def mutable_project_images(upstream: Path) -> tuple[str, ...]:
     return tuple(image for image in project_images(upstream) if not is_digest_locked_image(image))
 
 
-def load_image_map(path: Path | None, *, upstream: Path | None = None) -> dict[str, str]:
-    if path is None:
-        if upstream is not None:
-            raise FileNotFoundError(
-                "a complete image lock is required; run `cybergym-e2b images lock`"
-            )
-        return {}
+def load_image_map(path: Path, *, upstream: Path) -> dict[str, str]:
+    """Load a lock written by `images lock` and check it against the pinned inventory.
+
+    The lock may cover a subset of the inventory; each task is re-checked at resolution.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"image lock is missing: {path}; run `cybergym-e2b images lock --task <project>/<task>`"
+        )
     raw = json.loads(path.read_text(encoding="utf-8"))
-    if upstream is not None:
-        if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-            raise ValueError("runtime image lock must use schema version 1")
-        if raw.get("upstream") != {
-            "repository": UPSTREAM_REPOSITORY,
-            "commit": UPSTREAM_COMMIT,
-        }:
-            raise ValueError("image lock is for different CyberGym-E2E source inputs")
-        resolver = raw.get("resolver")
-        if (
-            not isinstance(resolver, dict)
-            or set(resolver) != {"tool", "version", "method"}
-            or not all(isinstance(value, str) and value for value in resolver.values())
-        ):
-            raise ValueError("image lock is missing resolver provenance")
-    images = raw.get("images", raw)
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError("runtime image lock must use schema version 1")
+    if raw.get("upstream") != {"repository": UPSTREAM_REPOSITORY, "commit": UPSTREAM_COMMIT}:
+        raise ValueError("image lock is for different CyberGym-E2E source inputs")
+    resolver = raw.get("resolver")
+    if (
+        not isinstance(resolver, dict)
+        or set(resolver) != {"tool", "version", "method"}
+        or not all(isinstance(value, str) and value for value in resolver.values())
+    ):
+        raise ValueError("image lock is missing resolver provenance")
+    images = raw.get("images")
     if not isinstance(images, dict) or not all(
         isinstance(key, str) and isinstance(value, str) for key, value in images.items()
     ):
-        raise ValueError("image map must contain a string-to-string 'images' object")
+        raise ValueError("image lock must contain a string-to-string 'images' object")
     for source, target in images.items():
-        require_digest_locked_image(target, label=f"image-map value for {source!r}")
+        require_digest_locked_image(target, label=f"image lock value for {source!r}")
         if (
             source == FFMPEG_IMAGE
             and target.rsplit(":", 1)[1] != FFMPEG_IMAGE_DIGEST.rsplit(":", 1)[1]
         ):
-            raise ValueError("image-map value for FFmpeg must preserve the known FFmpeg digest")
-    if upstream is not None:
-        required = set(mutable_project_images(upstream))
-        actual = set(images)
-        missing = sorted(required - actual)
-        unexpected = sorted(actual - required)
-        if missing:
-            raise ValueError(
-                f"image lock is incomplete: missing {len(missing)} mutable project image(s); "
-                f"first missing image: {missing[0]}"
-            )
-        if unexpected:
-            raise ValueError(
-                f"image lock has {len(unexpected)} image(s) absent from the pinned inventory; "
-                f"first unexpected image: {unexpected[0]}"
-            )
+            raise ValueError("image lock value for FFmpeg must preserve the known FFmpeg digest")
+    unexpected = sorted(set(images) - set(mutable_project_images(upstream)))
+    if unexpected:
+        raise ValueError(
+            f"image lock has {len(unexpected)} image(s) absent from the pinned inventory; "
+            f"first unexpected image: {unexpected[0]}"
+        )
     return images
 
 
 def require_immutable_runtime_image(resolved: ResolvedTask) -> None:
     """Fail before artifact reuse or sandbox creation on a mutable project image."""
-    require_digest_locked_image(
-        resolved.runtime_image,
-        label=f"runtime image for CyberGym-E2E task {resolved.task}",
-    )
+    if not is_digest_locked_image(resolved.runtime_image):
+        raise ValueError(
+            f"runtime image for CyberGym-E2E task {resolved.task} is not digest-locked "
+            f"(absent from the image lock): {resolved.runtime_image!r}; "
+            f"run `cybergym-e2b images lock --task {resolved.task}`"
+        )
 
 
 def inventory(upstream: Path) -> dict:
@@ -182,14 +173,12 @@ def build_code_bundle(
             project_target / resolved.task_id,
         )
         shutil.copy2(remote_smoke, temp / "scripts" / "e2b_smoke.py")
-        if remote_install_codex.is_file():
-            shutil.copy2(remote_install_codex, temp / "scripts" / "install_codex.sh")
+        shutil.copy2(remote_install_codex, temp / "scripts" / "install_codex.sh")
         shutil.copy2(remote_apt_retry, temp / "scripts" / "apt_retry.sh")
         subprocess.run(
             [
                 "git",
                 "apply",
-                "--unidiff-zero",
                 "--whitespace=nowarn",
                 str(patch_file.resolve()),
             ],
@@ -208,7 +197,3 @@ def build_code_bundle(
             archive.add(temp / "scripts", arcname="scripts")
             archive.add(temp / "projects", arcname="projects")
         return output.getvalue()
-
-
-def resolved_asdict(task: ResolvedTask) -> dict:
-    return asdict(task)

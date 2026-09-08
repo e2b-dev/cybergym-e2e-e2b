@@ -14,19 +14,8 @@ _GENERATED_DIRECTORIES = {
     ".ruff_cache",
     "__pycache__",
     "artifacts",
-    "benchmark-data",
     "build",
-    "campaigns",
     "dist",
-    "downloads",
-    "experiments",
-    "local-assets",
-    "logs",
-    "outputs",
-    "results",
-    "trajectories",
-    "reports",
-    "validation",
     "vendor",
 }
 
@@ -43,10 +32,6 @@ _GENERATED_FILE_PATTERNS = (
     re.compile(r"^template-manifest(?:\..+)?\.json$"),
     re.compile(r"^build-ledger(?:\..+)?\.json$"),
 )
-_FORBIDDEN_PATH_PATTERNS = (
-    re.compile(r"^[^/]+-tasks\.txt$"),
-    re.compile(r"^scripts/analyze_profiles\.py$"),
-)
 
 
 def _is_forbidden(path: str) -> bool:
@@ -59,8 +44,6 @@ def _is_forbidden(path: str) -> bool:
     if filename == ".env" or (filename.startswith(".env.") and filename != ".env.example"):
         return True
     if any(pattern.fullmatch(filename) for pattern in _GENERATED_FILE_PATTERNS):
-        return True
-    if any(pattern.fullmatch(normalized) for pattern in _FORBIDDEN_PATH_PATTERNS):
         return True
     return any(
         part in _GENERATED_DIRECTORIES

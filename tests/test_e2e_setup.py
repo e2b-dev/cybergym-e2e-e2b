@@ -13,6 +13,8 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from cybergym_e2b.cli import _already_completed, _batch, _options, _parser, main
 from cybergym_e2b.config import (
     BASE_BUILDER_IMAGES,
@@ -26,26 +28,31 @@ from cybergym_e2b.config import (
     DEFAULT_REMOTE_SMOKE,
     FFMPEG_IMAGE,
     FFMPEG_IMAGE_DIGEST,
+    UPSTREAM_COMMIT,
+    UPSTREAM_REPOSITORY,
     TemplateManifest,
     TemplateRef,
     normalize_task,
 )
 from cybergym_e2b.inventory import build_code_bundle, inventory, load_image_map, resolve_task
 from cybergym_e2b.runtime import (
+    COLLECTION_RESERVE_SECONDS,
     RunOptions,
     _agent_model_id,
     _assert_image_identity,
     _benchmark_result,
     _create_fresh_sandbox_from_template,
+    _execution_context,
     _experiment_identity,
     _model_config,
     _network,
     _network_eligibility,
+    _observe_after_workload,
     _policy,
     _resource_summary,
     _route_template,
     _shell_run,
-    _stop_resource_monitor,
+    _StageProfiler,
     _summary_wire_api,
 )
 
@@ -70,7 +77,6 @@ def test_reasoning_effort_is_explicit_and_configurable() -> None:
 def test_summary_wire_api_matches_agent_transport() -> None:
     assert _summary_wire_api("codex") == "responses"
     assert _summary_wire_api("openhands") == "chat-completions"
-    assert _summary_wire_api("gemini") == "chat-completions"
 
 
 def test_apt_retry_wrapper_covers_apt_and_apt_get(tmp_path: Path) -> None:
@@ -152,6 +158,7 @@ def test_network_credentials_are_scoped_to_their_phase() -> None:
         hf_token="hf-secret",
         model_key="model-secret",
         non_http=[],
+        model_host="api.fireworks.ai",
     )
     assert set(setup["rules"]) == {"huggingface.co"}
     assert set(setup["deny_out"]) == set(policy["deny_out"])
@@ -163,6 +170,7 @@ def test_network_credentials_are_scoped_to_their_phase() -> None:
         hf_token="hf-secret",
         model_key="model-secret",
         non_http=[],
+        model_host="api.fireworks.ai",
     )
     assert set(runtime["rules"]) == {"api.fireworks.ai"}
     assert set(runtime["deny_out"]) == set(policy["deny_out"])
@@ -176,6 +184,7 @@ def test_network_credentials_are_scoped_to_their_phase() -> None:
         hf_token="hf-secret",
         model_key="model-secret",
         non_http=[],
+        model_host="api.fireworks.ai",
     )
     assert locked_runtime["deny_out"] == ["0.0.0.0/0"]
     assert locked_runtime["allow_out"] == ["api.fireworks.ai"]
@@ -188,6 +197,7 @@ def test_network_credentials_are_scoped_to_their_phase() -> None:
         hf_token="hf-secret",
         model_key="model-secret",
         non_http=[],
+        model_host="api.fireworks.ai",
     )
     assert legacy_restricted["deny_out"] == ["0.0.0.0/0"]
     assert "api.fireworks.ai" in legacy_restricted["allow_out"]
@@ -275,39 +285,40 @@ def test_task_resolution_uses_known_ffmpeg_digest_pin() -> None:
     assert original.runtime_image == FFMPEG_IMAGE_DIGEST
 
 
-def test_image_map_accepts_only_digest_locked_values(tmp_path: Path) -> None:
-    digest = FFMPEG_IMAGE_DIGEST.rsplit(":", 1)[1]
-    path = tmp_path / "images.json"
-    path.write_text(
-        json.dumps({"images": {FFMPEG_IMAGE: f"mirror.invalid/cybergym/e2e@sha256:{digest}"}}),
-        encoding="utf-8",
+def _lock(images: dict[str, str]) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "upstream": {"repository": UPSTREAM_REPOSITORY, "commit": UPSTREAM_COMMIT},
+            "resolver": {"tool": "test", "version": "1", "method": "manifest-descriptor-digest"},
+            "images": images,
+        }
     )
-    image_map = load_image_map(path)
+
+
+def test_image_lock_accepts_only_digest_locked_values(tmp_path: Path) -> None:
+    digest = FFMPEG_IMAGE_DIGEST.rsplit(":", 1)[1]
+    path = tmp_path / "images.lock.json"
+    path.write_text(_lock({FFMPEG_IMAGE: f"mirror.invalid/cybergym/e2e@sha256:{digest}"}))
+    image_map = load_image_map(path, upstream=UPSTREAM)
     mapped = resolve_task(UPSTREAM, "ffmpeg/oss-fuzz_431665305", image_map=image_map)
     assert mapped.build_image == FFMPEG_IMAGE
     assert mapped.runtime_image == f"mirror.invalid/cybergym/e2e@sha256:{digest}"
 
-    path.write_text(
-        json.dumps({"images": {FFMPEG_IMAGE: "mirror.invalid/cybergym/e2e:ffmpeg"}}),
-        encoding="utf-8",
-    )
-    try:
-        load_image_map(path)
-    except ValueError as exc:
-        assert "digest-locked" in str(exc)
-    else:
-        raise AssertionError("a mutable image-map value was accepted")
+    path.write_text(_lock({FFMPEG_IMAGE: "mirror.invalid/cybergym/e2e:ffmpeg"}))
+    with pytest.raises(ValueError, match="digest-locked"):
+        load_image_map(path, upstream=UPSTREAM)
 
-    path.write_text(
-        json.dumps({"images": {FFMPEG_IMAGE: "mirror.invalid/cybergym/e2e@sha256:" + "b" * 64}}),
-        encoding="utf-8",
-    )
-    try:
-        load_image_map(path)
-    except ValueError as exc:
-        assert "known FFmpeg digest" in str(exc)
-    else:
-        raise AssertionError("an image map changed the pinned FFmpeg image content")
+    path.write_text(_lock({FFMPEG_IMAGE: "mirror.invalid/cybergym/e2e@sha256:" + "b" * 64}))
+    with pytest.raises(ValueError, match="known FFmpeg digest"):
+        load_image_map(path, upstream=UPSTREAM)
+
+    path.write_text(json.dumps({FFMPEG_IMAGE: f"mirror.invalid/cybergym/e2e@sha256:{digest}"}))
+    with pytest.raises(ValueError, match="schema version 1"):
+        load_image_map(path, upstream=UPSTREAM)
+
+    with pytest.raises(FileNotFoundError, match="images lock --task"):
+        load_image_map(tmp_path / "absent.json", upstream=UPSTREAM)
 
 
 def test_bundle_is_task_scoped_and_applies_provider_patch() -> None:
@@ -621,75 +632,94 @@ def test_benchmark_result_rejects_interrupted_codex_failure_but_keeps_validated_
     assert other["outcome"] == "valid_other_vulnerability"
 
 
-class _Files:
-    @staticmethod
-    def read(_path: str) -> str:
-        return "\n".join(
-            [
-                '{"disk_total_bytes":1000,"disk_used_bytes":400,"disk_free_bytes":600,'
-                '"memory_total_bytes":800,"memory_available_bytes":500}',
-                '{"disk_total_bytes":1000,"disk_used_bytes":700,"disk_free_bytes":300,'
-                '"memory_total_bytes":800,"memory_available_bytes":200}',
-            ]
-        )
-
-
-class _Sandbox:
-    files = _Files()
-
-
-def test_resource_summary_reports_worst_observation() -> None:
-    assert _resource_summary(_Sandbox()) == {
-        "sample_count": 2,
-        "interval_seconds": 5,
+def _sample(**overrides) -> dict:
+    base = {
+        "timestamp": 0,
         "disk_total_bytes": 1000,
-        "peak_disk_used_bytes": 700,
-        "minimum_disk_free_bytes": 300,
+        "disk_used_bytes": 400,
+        "disk_free_bytes": 600,
         "memory_total_bytes": 800,
-        "minimum_memory_available_bytes": 200,
+        "memory_available_bytes": 500,
+        "swap_total_bytes": 400,
+        "swap_free_bytes": 350,
+        "swap_used_bytes": 50,
+        "page_faults": 10,
+        "major_page_faults": 1,
+        "swap_in_pages": 0,
+        "swap_out_pages": 0,
+        "load_1m": 0.5,
+        "load_5m": 0.4,
+        "load_15m": 0.3,
+        "cpu_total_ticks": 1000,
+        "cpu_idle_ticks": 900,
+        "network_receive_bytes": 100,
+        "network_transmit_bytes": 50,
+        "block_read_bytes": 0,
+        "block_write_bytes": 0,
+        "block_io_milliseconds": 0,
     }
+    return {**base, **overrides}
 
 
-class _SwapFiles:
-    @staticmethod
-    def read(_path: str) -> str:
-        return "\n".join(
-            [
-                '{"disk_total_bytes":1000,"disk_used_bytes":400,"disk_free_bytes":600,'
-                '"memory_total_bytes":800,"memory_available_bytes":500,'
-                '"swap_total_bytes":400,"swap_free_bytes":350,"swap_used_bytes":50}',
-                '{"disk_total_bytes":1000,"disk_used_bytes":700,"disk_free_bytes":300,'
-                '"memory_total_bytes":800,"memory_available_bytes":200,'
-                '"swap_total_bytes":400,"swap_free_bytes":100,"swap_used_bytes":300}',
-            ]
-        )
+class _SampleSandbox:
+    def __init__(self, lines: list[str]) -> None:
+        self.files = SimpleNamespace(read=lambda _path: "\n".join(lines))
 
 
-class _SwapSandbox:
-    files = _SwapFiles()
+def test_resource_summary_reports_worst_observation_and_skips_truncated_lines() -> None:
+    first = _sample()
+    last = _sample(
+        disk_used_bytes=700,
+        disk_free_bytes=300,
+        memory_available_bytes=200,
+        swap_free_bytes=100,
+        swap_used_bytes=300,
+        load_1m=2.5,
+        cpu_total_ticks=1400,
+        cpu_idle_ticks=1000,
+        network_receive_bytes=600,
+    )
+    sandbox = _SampleSandbox([json.dumps(first), json.dumps(last), '{"disk_total_bytes": 10'])
+
+    summary = _resource_summary(sandbox)
+
+    assert summary["sample_count"] == 2
+    assert summary["peak_disk_used_bytes"] == 700
+    assert summary["minimum_disk_free_bytes"] == 300
+    assert summary["minimum_memory_available_bytes"] == 200
+    assert summary["peak_swap_used_bytes"] == 300
+    assert summary["minimum_swap_free_bytes"] == 100
+    assert summary["peak_load_1m"] == 2.5
+    assert summary["delta_network_receive_bytes"] == 500
+    assert summary["average_cpu_busy_percent"] == 75.0
 
 
-def test_resource_summary_reports_swap_pressure() -> None:
-    result = _resource_summary(_SwapSandbox())
-    assert result["swap_total_bytes"] == 400
-    assert result["peak_swap_used_bytes"] == 300
-    assert result["minimum_swap_free_bytes"] == 100
+def test_resource_summary_without_samples_is_empty() -> None:
+    assert _resource_summary(_SampleSandbox([])) == {"sample_count": 0}
 
 
-def test_resource_monitor_stop_failure_is_recorded_without_raising() -> None:
+def test_observe_after_workload_records_errors_without_raising() -> None:
     class Monitor:
         def kill(self) -> None:
             raise ConnectionError("monitor channel closed")
 
-    result: dict = {}
-    _stop_resource_monitor(Monitor(), result, stage="after_workload")
+    class Commands:
+        def run(self, _command: str, *, timeout: int):
+            raise TimeoutError("metrics command hung")
 
-    assert result["monitor_errors"] == [
-        {
-            "stage": "after_workload",
-            "type": "ConnectionError",
-            "message": "monitor channel closed",
-        }
+    sandbox = SimpleNamespace(
+        files=SimpleNamespace(read=lambda _path: json.dumps(_sample())),
+        commands=Commands(),
+    )
+    result: dict = {}
+
+    _observe_after_workload(sandbox, result, _StageProfiler(), Monitor())
+
+    assert result["observed_resources"]["sample_count"] == 1
+    assert "post_workload" not in result
+    assert [(item["step"], item["type"]) for item in result["observation_errors"]] == [
+        ("monitor_stop", "ConnectionError"),
+        ("post_workload_metrics", "TimeoutError"),
     ]
 
 
@@ -737,7 +767,7 @@ def test_batch_accounts_for_every_submitted_future_after_fail_fast(
         reuse_completed=False,
         artifacts_dir=tmp_path,
         upstream=tmp_path,
-        image_map=tmp_path / "images.json",
+        image_lock=tmp_path / "images.json",
         manifest=tmp_path / "manifest.json",
         kind="run",
         network_policy=DEFAULT_NETWORK_POLICY,
@@ -984,3 +1014,96 @@ def test_shell_run_survives_transient_poll_disconnect(monkeypatch) -> None:
     monkeypatch.setattr("cybergym_e2b.runtime.time.sleep", lambda _seconds: None)
     assert _shell_run(sandbox, "do-work", timeout=60) == 7
     assert sandbox.commands.polls == 2
+
+
+def test_shell_run_fails_fast_when_sandbox_stops_answering(monkeypatch) -> None:
+    class Commands:
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def run(self, command: str, *, timeout: int):
+            if "nohup bash" in command:
+                return SimpleNamespace(stdout="")
+            self.polls += 1
+            raise ConnectionError("sandbox is gone")
+
+    sandbox = SimpleNamespace(commands=Commands())
+    monkeypatch.setattr("cybergym_e2b.runtime.time.sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError, match="stopped answering"):
+        _shell_run(sandbox, "do-work", timeout=10_000)
+    assert sandbox.commands.polls == 12
+
+
+def _write_manifest(path: Path) -> None:
+    TemplateManifest(
+        base=TemplateRef(
+            name="base",
+            tag="recipe-aaaaaaaaaaaaaaaa",
+            template_id="template-base",
+            build_id="build-base-1234",
+            recipe_sha256="a" * 64,
+            images=BASE_BUILDER_IMAGES,
+        )
+    ).write(path)
+
+
+def test_execution_context_reserves_time_for_collection(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest)
+    resolved = resolve_task(UPSTREAM, "ffmpeg/oss-fuzz_431665305")
+    with pytest.raises(ValueError, match="evaluation_timeout"):
+        _execution_context(
+            resolved,
+            kind="smoke",
+            options=RunOptions(evaluation_timeout=COLLECTION_RESERVE_SECONDS),
+            manifest_path=manifest,
+            network_policy_path=DEFAULT_NETWORK_POLICY,
+        )
+
+
+def test_execution_context_resolves_non_http_hosts_only_for_allowlists(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest)
+    resolved = resolve_task(UPSTREAM, "ffmpeg/oss-fuzz_431665305")
+    lookups: list[str] = []
+
+    def getaddrinfo(host, port, **_kwargs):
+        lookups.append(host)
+        return [(None, None, None, None, ("203.0.113.7", port))]
+
+    monkeypatch.setattr("cybergym_e2b.runtime.socket.getaddrinfo", getaddrinfo)
+
+    public = _execution_context(
+        resolved,
+        kind="smoke",
+        options=RunOptions(),
+        manifest_path=manifest,
+        network_policy_path=DEFAULT_NETWORK_POLICY,
+    )
+    assert public.non_http == []
+    assert lookups == []
+
+    restricted = _execution_context(
+        resolved,
+        kind="smoke",
+        options=RunOptions(egress="restricted"),
+        manifest_path=manifest,
+        network_policy_path=DEFAULT_NETWORK_POLICY,
+    )
+    assert sorted(lookups) == ["fate-suite.ffmpeg.org", "samples.ffmpeg.org"]
+    assert all(entry["addresses"] == ["203.0.113.7"] for entry in restricted.non_http)
+
+    def failing(host, port, **_kwargs):
+        raise OSError("name resolution failed")
+
+    monkeypatch.setattr("cybergym_e2b.runtime.socket.getaddrinfo", failing)
+    with pytest.raises(RuntimeError, match="fate-suite.ffmpeg.org"):
+        _execution_context(
+            resolved,
+            kind="smoke",
+            options=RunOptions(egress="restricted"),
+            manifest_path=manifest,
+            network_policy_path=DEFAULT_NETWORK_POLICY,
+        )

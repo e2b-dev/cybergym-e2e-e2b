@@ -100,9 +100,8 @@ DEFAULT_FFMPEG_TEMPLATE_NAME = "cybergym-e2e-ffmpeg"
 DEFAULT_MODEL = "openai.gpt-5.4"
 DEFAULT_MODEL_PROVIDER = "bedrock"
 _TASK_PATH = re.compile(r"^[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+$")
-_TEMPLATE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-_TEMPLATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,}$")
-_BUILD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,}$")
+TEMPLATE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_E2B_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,}$")
 _RECIPE_TAG = re.compile(r"^recipe-([0-9a-f]{16})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
@@ -164,9 +163,9 @@ class TemplateRef:
     @property
     def reference(self) -> str:
         if (
-            not _TEMPLATE_NAME.fullmatch(self.name)
-            or not _TEMPLATE_ID.fullmatch(self.template_id)
-            or not _BUILD_ID.fullmatch(self.build_id)
+            not TEMPLATE_NAME.fullmatch(self.name)
+            or not _E2B_ID.fullmatch(self.template_id)
+            or not _E2B_ID.fullmatch(self.build_id)
             or not _SHA256.fullmatch(self.recipe_sha256)
         ):
             raise ValueError("template does not have a valid tagged build receipt")
