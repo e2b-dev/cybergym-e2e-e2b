@@ -1,0 +1,26 @@
+{
+  "default_action": "deny",
+  "deny_out": [],
+  "model_hosts": [
+    "api.fireworks.ai",
+    "bedrock-mantle.us-west-2.api.aws"
+  ],
+  "artifact_hosts": [
+    "huggingface.co",
+    "*.huggingface.co",
+    "*.cdn.hf.co",
+    "*.xethub.hf.co"
+  ],
+  "registry_hosts": [
+    "auth.docker.io",
+    "registry-1.docker.io",
+    "production.cloudflare.docker.com",
+    "production.cloudfront.docker.com",
+    "docker.io",
+    "gcr.io",
+    "*.gcr.io",
+    "storage.googleapis.com"
+  ],
+  "runtime_dependency_hosts": [],
+  "non_http_hosts": []
+}

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.12.1"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install "${{ matrix.python-version }}"
+
+      - name: Sync locked dependencies
+        run: uv sync --locked --python "${{ matrix.python-version }}"
+
+      - name: Enforce the public-tree policy
+        run: uv run --locked --python "${{ matrix.python-version }}" python scripts/check_public_tree.py
+
+      - name: Sync pinned public upstream source
+        run: uv run --locked --python "${{ matrix.python-version }}" cybergym-e2b sync-upstream
+
+      - name: Run tests
+        env:
+          E2B_API_KEY: ""
+          HF_TOKEN: ""
+          AWS_MANTLE: ""
+          FIREWORKS_AI_API_KEY: ""
+        run: uv run --locked --python "${{ matrix.python-version }}" pytest -q
+
+      - name: Lint
+        run: uv run --locked --python "${{ matrix.python-version }}" ruff check .
+
+      - name: Check formatting
+        run: uv run --locked --python "${{ matrix.python-version }}" ruff format --check .
+
+      - name: Build distributions
+        run: uv build --python "${{ matrix.python-version }}" --no-build-isolation --clear
+
+      - name: Check distributions
+        run: uv run --locked --python "${{ matrix.python-version }}" twine check dist/*
+
+  release-contract:
+    name: Release contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: "0.12.1"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Build and inspect distributions
+        run: |
+          uv sync --locked --python 3.13
+          uv build --python 3.13 --no-build-isolation --clear
+          uv run --locked --python 3.13 twine check dist/*
+          unzip -l dist/*.whl | grep -F 'licenses/LICENSE'
+          unzip -l dist/*.whl | grep -F 'cybergym_e2b/assets/remote/e2b_smoke.py'
+
+      - name: Verify installed CLI outside the checkout
+        run: |
+          uv venv --python 3.13 /tmp/cybergym-wheel
+          uv pip install --python /tmp/cybergym-wheel/bin/python dist/*.whl
+          cd /tmp
+          /tmp/cybergym-wheel/bin/cybergym-e2b --help
+          /tmp/cybergym-wheel/bin/python -c 'from cybergym_e2b.config import DEFAULT_NETWORK_POLICY; assert DEFAULT_NETWORK_POLICY.is_file()'
+
+      - name: Test the extracted source distribution
+        run: |
+          mkdir /tmp/cybergym-sdist
+          tar -xzf dist/*.tar.gz -C /tmp/cybergym-sdist --strip-components=1
+          cd /tmp/cybergym-sdist
+          uv sync --locked --python 3.13
+          uv run --locked --python 3.13 cybergym-e2b sync-upstream
+          uv run --locked --python 3.13 pytest -q

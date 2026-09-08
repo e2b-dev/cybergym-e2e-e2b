@@ -32,6 +32,10 @@ htmlcov/
 
 # Generated benchmark output and runtime state
 artifacts/
+campaigns/
+reports/
+docs/validation/
+experiments/
 results/
 outputs/
 trajectories/
@@ -39,6 +43,17 @@ logs/
 *.log
 *.pid
 *.pid.lock
+template-manifest*.json
+build-ledger*.json
+credentials.json
+credentials.toml
+credentials.yaml
+credentials.yml
+*.key
+*.p12
+*.pfx
+/*-tasks.txt
+/scripts/analyze_profiles.py
 
 # Downloaded, gated, vendored, and local-only assets
 downloads/

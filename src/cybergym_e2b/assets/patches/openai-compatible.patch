@@ -1,0 +1,116 @@
+diff --git a/scripts/run_agent.py b/scripts/run_agent.py
+index bb67950..aae4d4f 100644
+--- a/scripts/run_agent.py
++++ b/scripts/run_agent.py
+@@ -631,0 +632 @@ model_provider = "openai_http"
++model_reasoning_effort = "{args.reasoning_effort}"
+@@ -636,0 +638 @@ supports_websockets = false
++wire_api = "responses"
+@@ -788,0 +791,6 @@ def run_agent(args, config, script_path, data_path, prompt, attempt, work_dir, t
++        e2b_ca_bundle = os.environ.get("E2B_CA_BUNDLE")
++        if e2b_ca_bundle:
++            copy_to_container(
++                container_id, Path(e2b_ca_bundle), "/etc/ssl/certs/ca-certificates.crt"
++            )
++
+@@ -881 +890 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
+-            if args.mode == "e2e" and not poc_file.exists():
++            if args.mode == "e2e" and (poc_file is None or not poc_file.exists()):
+@@ -896 +905 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
+-            if not patch_file.exists():
++            if patch_file is None or not patch_file.exists():
+@@ -972 +981,5 @@ def run_agent_loop(args, config, script_path, data_path, run_dir):
+-                trajectory_summary = summarize_trajectory(log_file, attempt, args)
++                trajectory_summary = (
++                    summarize_trajectory(log_file, attempt, args)
++                    if attempt < args.max_attempts
++                    else None
++                )
+@@ -1049 +1057 @@ Examples:
+-    parser.add_argument("--model-provider", choices=["litellm", "bedrock", "anthropic"], default="anthropic",
++    parser.add_argument("--model-provider", choices=["litellm", "bedrock", "anthropic", "openai-compatible"], default="anthropic",
+@@ -1051,0 +1060 @@ Examples:
++    parser.add_argument("--reasoning-effort", choices=["low", "medium", "high", "xhigh"], default="high")
+diff --git a/scripts/utils.py b/scripts/utils.py
+index f8b8b82..54ae678 100644
+--- a/scripts/utils.py
++++ b/scripts/utils.py
+@@ -176,0 +177,12 @@ def setup_workspace(container_id, data_path, script_path, mode="e2e", copy_gt_po
++    if not scripts_dir:
++        raise ValueError("scripts_dir required for openhands")
++    # Install both package-manager entry points before the first update. Task scripts
++    # use a mix of apt and apt-get, and mirror publication can be briefly inconsistent.
++    for apt_command in ("apt", "apt-get"):
++        copy_to_container(
++            container_id,
++            scripts_dir / "apt_retry.sh",
++            f"/usr/local/bin/{apt_command}",
++        )
++    exec_run(container_id, "chmod 0755 /usr/local/bin/apt /usr/local/bin/apt-get", workdir="/", verbose=False, check=True)
++
+@@ -179 +191 @@ def setup_workspace(container_id, data_path, script_path, mode="e2e", copy_gt_po
+-        "apt-get update -qq && apt-get install -y -qq sudo git >/dev/null 2>&1",
++        "if ! command -v sudo >/dev/null; then printf '#!/bin/sh\\nif [ \"$1\" = \"-E\" ]; then shift; fi\\nexec \"$@\"\\n' > /usr/local/bin/sudo && chmod 0755 /usr/local/bin/sudo; fi; if ! command -v git >/dev/null; then grep -rLiE 'archive.ubuntu.com|security.ubuntu.com|ports.ubuntu.com|old-releases.ubuntu.com|deb.debian.org|security.debian.org' /etc/apt/sources.list.d/ 2>/dev/null | xargs -r -I{} mv {} /tmp/ 2>/dev/null; sed -ri '/apt.kitware.com|bazel-apt|apt.llvm.org|packages.cloud.google.com|storage.googleapis.com|download.docker.com|dl.yarnpkg.com|deb.nodesource.com|ppa.launchpad|nginx.org|packagecloud.io|cran.r-project|pgdg/d' /etc/apt/sources.list 2>/dev/null; find /etc/apt/sources.list.d -type f -exec sed -ri '/apt.kitware.com|bazel-apt|apt.llvm.org|packages.cloud.google.com|storage.googleapis.com|download.docker.com|dl.yarnpkg.com|nginx.org|packagecloud.io|cran.r-project|pgdg/d' {} + 2>/dev/null; apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1; fi",
+@@ -184,2 +195,0 @@ def setup_workspace(container_id, data_path, script_path, mode="e2e", copy_gt_po
+-    if not scripts_dir:
+-        raise ValueError("scripts_dir required for openhands")
+@@ -198,0 +209,9 @@ def setup_workspace(container_id, data_path, script_path, mode="e2e", copy_gt_po
++    # The Opus model host offers an rsync mirror but its HTTPS endpoint is
++    # intermittently unavailable. Hot E2B templates carry the checksum-pinned
++    # archive so FFmpeg setup remains reproducible under restricted egress.
++    opus_model_cache = os.getenv("E2B_OPUS_MODEL_CACHE")
++    if opus_model_cache and Path(opus_model_cache).is_file() and subprocess.run(
++        ["docker", "exec", container_id, "test", "-d", "/src/opus"]
++    ).returncode == 0:
++        copy_to_container(container_id, opus_model_cache, f"/src/opus/{Path(opus_model_cache).name}")
++
+@@ -331,0 +351,24 @@ def call_llm(
++        elif model_provider == "openai-compatible":
++            import openai
++
++            client = openai.OpenAI(
++                http_client=httpx.Client(verify=os.environ.get("E2B_CA_BUNDLE", True))
++            )
++            provider_model_id = litellm_model_id.removeprefix("openai/")
++            wire_api = os.environ.get("E2B_OPENAI_WIRE_API", "chat-completions")
++            if wire_api == "responses":
++                response = client.responses.create(
++                    model=provider_model_id,
++                    input=prompt,
++                    max_output_tokens=max_tokens,
++                )
++                return response.output_text
++            if wire_api == "chat-completions":
++                response = client.chat.completions.create(
++                    model=provider_model_id,
++                    messages=[{"role": "user", "content": prompt}],
++                    max_tokens=max_tokens,
++                    temperature=0.0,
++                )
++                return response.choices[0].message.content
++            raise ValueError(f"unsupported OpenAI-compatible wire API: {wire_api}")
+@@ -385,0 +429,5 @@ def get_llm_env(
++        # OpenAI-compatible catalog IDs are absent from LiteLLM's static metadata.
++        # Pin conservative limits so OpenHands does not assume a 4K context window.
++        "LLM_MAX_INPUT_TOKENS": "131072",
++        "LLM_MAX_OUTPUT_TOKENS": "8192",
++        "LLM_NATIVE_TOOL_CALLING": "true",
+@@ -387,0 +436,7 @@ def get_llm_env(
++    if os.getenv("E2B_CA_BUNDLE"):
++        base_env.update({
++            "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
++            "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
++            "NODE_EXTRA_CA_CERTS": "/etc/ssl/certs/ca-certificates.crt",
++        })
++
+diff --git a/scripts/install_validate_deps.sh b/scripts/install_validate_deps.sh
+index 42ca8a3..4a155df 100644
+--- a/scripts/install_validate_deps.sh
++++ b/scripts/install_validate_deps.sh
+@@ -3,2 +3,4 @@
+-apt-get update
+-apt-get install -y curl
++if ! command -v curl >/dev/null; then
++    apt-get update
++    apt-get install -y curl
++fi
