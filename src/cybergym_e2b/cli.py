@@ -206,7 +206,10 @@ def _verify_upstream(path: Path) -> str:
         ["git", "status", "--porcelain"], cwd=path, check=True, capture_output=True, text=True
     ).stdout.strip()
     if status:
-        raise RuntimeError(f"upstream checkout is dirty; run sync-upstream: {path}")
+        raise RuntimeError(
+            f"upstream checkout is dirty: {path}; discard local changes with "
+            f"`git -C {path} checkout -- . && git clean -fd` or delete it and rerun sync-upstream"
+        )
     return commit
 
 
@@ -224,6 +227,15 @@ def _sync(path: Path) -> dict:
     subprocess.run(["git", "fetch", "origin", UPSTREAM_COMMIT], cwd=path, check=True)
     subprocess.run(["git", "checkout", "--detach", UPSTREAM_COMMIT], cwd=path, check=True)
     return {"repository": UPSTREAM_REPOSITORY, "commit": _verify_upstream(path), "path": str(path)}
+
+
+def _require_asset_files(args: argparse.Namespace) -> None:
+    """Fail fast on a mistyped runtime asset override instead of once per task."""
+    for field in ("network_policy", "patch_file", "remote_smoke", "remote_install_codex"):
+        path = getattr(args, field, None)
+        if path is not None and not Path(path).is_file():
+            flag = "--" + field.replace("_", "-")
+            raise FileNotFoundError(f"{flag} is not a file: {path}")
 
 
 def _options(args: argparse.Namespace) -> RunOptions:
@@ -441,6 +453,7 @@ def _batch(args: argparse.Namespace) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        _require_asset_files(args)
         if args.command == "sync-upstream":
             result = _sync(args.upstream)
         elif args.command == "inventory":
@@ -503,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
             options = _options(args)
             context = _execution_context(
                 resolved,
+                kind=args.kind,
                 options=options,
                 manifest_path=args.manifest,
                 network_policy_path=args.network_policy,

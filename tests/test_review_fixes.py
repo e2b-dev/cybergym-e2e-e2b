@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import io
+import json
 import subprocess
 import tarfile
 from io import BytesIO
@@ -8,12 +8,18 @@ from pathlib import Path
 
 import pytest
 
-from cybergym_e2b.cli import _parser, _verify_upstream
-from cybergym_e2b.config import asset_path
+from cybergym_e2b.cli import _parser, _verify_upstream, main
+from cybergym_e2b.config import DEFAULT_NETWORK_POLICY, DEFAULT_PATCH_FILE, asset_path
 from cybergym_e2b.inventory import build_code_bundle, resolve_task
-from cybergym_e2b.runtime import _network, _policy
+from cybergym_e2b.runtime import (
+    _extract_results,
+    _network,
+    _policy,
+    _require_runnable_policy,
+)
 
 UPSTREAM = Path("vendor/cybergym-e2e")
+LOCKED_POLICY = asset_path("policies/network-locked.json")
 
 
 def test_patch_keeps_anthropic_return_ahead_of_openai_compatible_branch() -> None:
@@ -28,42 +34,61 @@ def test_patch_keeps_anthropic_return_ahead_of_openai_compatible_branch() -> Non
     assert anthropic_return < new_branch
 
 
-def test_verify_upstream_rejects_dirty_checkout(tmp_path: Path, monkeypatch) -> None:
-    repo = tmp_path / "upstream"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    (repo / "tracked.txt").write_text("pinned\n")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+def test_patch_carries_context_and_applies_without_unidiff_zero() -> None:
+    check = subprocess.run(
+        ["git", "apply", "--check", str(DEFAULT_PATCH_FILE.resolve())],
+        cwd=UPSTREAM,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stderr
+
+
+def _git_repo_with_commit(root: Path) -> str:
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / "tracked.txt").write_text("pinned\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
     subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-m", "pin"],
-        cwd=repo,
+        cwd=root,
         check=True,
     )
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+def test_verify_upstream_rejects_dirty_checkout(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "upstream"
+    head = _git_repo_with_commit(repo)
     monkeypatch.setattr("cybergym_e2b.cli.UPSTREAM_COMMIT", head)
 
     assert _verify_upstream(repo) == head
 
     (repo / "tracked.txt").write_text("edited validator\n")
-    with pytest.raises(RuntimeError, match="dirty"):
+    with pytest.raises(RuntimeError, match="dirty") as excinfo:
         _verify_upstream(repo)
+    # sync-upstream refuses dirty trees too, so the message must name a remedy that works.
+    assert "git clean" in str(excinfo.value)
 
 
-def _tarball(members: dict[str, bytes]) -> bytes:
-    buffer = io.BytesIO()
+def _tarball(members: dict[str, bytes | Path]) -> bytes:
+    buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for name, data in members.items():
             info = tarfile.TarInfo(name)
-            info.size = len(data)
-            archive.addfile(info, io.BytesIO(data))
+            if isinstance(data, Path):
+                info.type = tarfile.SYMTYPE
+                info.linkname = str(data)
+                archive.addfile(info)
+            else:
+                info.size = len(data)
+                archive.addfile(info, BytesIO(data))
     return buffer.getvalue()
 
 
 def test_extract_results_rejects_parent_traversal(tmp_path: Path) -> None:
-    from cybergym_e2b.runtime import _extract_results
-
     archive_path = tmp_path / "results.tgz"
     archive_path.write_bytes(_tarball({"../escape.txt": b"x"}))
     with pytest.raises(RuntimeError, match="unsafe path"):
@@ -72,12 +97,26 @@ def test_extract_results_rejects_parent_traversal(tmp_path: Path) -> None:
 
 
 def test_extract_results_extracts_nested_members(tmp_path: Path) -> None:
-    from cybergym_e2b.runtime import _extract_results
-
     archive_path = tmp_path / "results.tgz"
     archive_path.write_bytes(_tarball({"./agent_output/run/log.txt": b"ok"}))
     _extract_results(archive_path, tmp_path / "sandbox")
     assert (tmp_path / "sandbox" / "agent_output" / "run" / "log.txt").read_bytes() == b"ok"
+
+
+def test_extract_results_drops_link_members_and_keeps_files(tmp_path: Path) -> None:
+    archive_path = tmp_path / "results.tgz"
+    archive_path.write_bytes(
+        _tarball(
+            {
+                "./agent_output/fix.patch": Path("/etc/passwd"),
+                "./agent_output/summary.json": b"{}",
+            }
+        )
+    )
+    _extract_results(archive_path, tmp_path / "sandbox")
+    assert (tmp_path / "sandbox" / "agent_output" / "summary.json").read_bytes() == b"{}"
+    assert not (tmp_path / "sandbox" / "agent_output" / "fix.patch").is_symlink()
+    assert not (tmp_path / "sandbox" / "agent_output" / "fix.patch").exists()
 
 
 def test_gemini_cli_is_not_an_accepted_agent() -> None:
@@ -85,9 +124,9 @@ def test_gemini_cli_is_not_an_accepted_agent() -> None:
         _parser().parse_args(["run", "curl/arvo_66012", "--agent", "gemini-cli"])
 
 
-@pytest.mark.parametrize("policy_name", ["network.json", "network-locked.json"])
-def test_packaged_policies_accept_any_bedrock_region(policy_name: str) -> None:
-    policy = _policy(asset_path(f"policies/{policy_name}"))
+@pytest.mark.parametrize("policy_path", [DEFAULT_NETWORK_POLICY, LOCKED_POLICY])
+def test_packaged_policies_accept_any_bedrock_region(policy_path: Path) -> None:
+    policy = _policy(policy_path)
     host = "bedrock-mantle.eu-west-1.api.aws"
     network = _network(
         policy,
@@ -102,7 +141,33 @@ def test_packaged_policies_accept_any_bedrock_region(policy_name: str) -> None:
     assert set(network["rules"]) == {host}
 
 
+def test_packaged_policies_share_host_lists() -> None:
+    default = _policy(DEFAULT_NETWORK_POLICY)
+    locked = _policy(LOCKED_POLICY)
+    for key in ("model_hosts", "artifact_hosts", "registry_hosts"):
+        assert default[key] == locked[key], key
+
+
+def test_locked_policy_refuses_agent_runs_but_allows_smoke() -> None:
+    locked = _policy(LOCKED_POLICY)
+    with pytest.raises(ValueError, match="agent tooling"):
+        _require_runnable_policy(locked, kind="run", egress="policy")
+    _require_runnable_policy(locked, kind="smoke", egress="policy")
+    default = _policy(DEFAULT_NETWORK_POLICY)
+    _require_runnable_policy(default, kind="run", egress="policy")
+    _require_runnable_policy(default, kind="run", egress="restricted")
+
+
 def test_bundle_rejects_missing_install_codex_override(tmp_path: Path) -> None:
     resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
     with pytest.raises(FileNotFoundError):
         build_code_bundle(UPSTREAM, resolved, remote_install_codex=tmp_path / "missing.sh")
+
+
+def test_cli_validates_asset_overrides_before_doing_work(tmp_path: Path, capsys) -> None:
+    missing = tmp_path / "instal_codex.sh"
+    code = main(["preflight", "--remote-install-codex", str(missing)])
+    assert code == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["type"] == "FileNotFoundError"
+    assert "instal_codex.sh" in error["message"]

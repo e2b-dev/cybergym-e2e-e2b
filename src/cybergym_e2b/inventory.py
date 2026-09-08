@@ -188,7 +188,6 @@ def build_code_bundle(
             [
                 "git",
                 "apply",
-                "--unidiff-zero",
                 "--whitespace=nowarn",
                 str(patch_file.resolve()),
             ],

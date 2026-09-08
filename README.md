@@ -129,7 +129,7 @@ validator:
 uv run cybergym-e2b smoke curl/arvo_66012
 ```
 
-Run one source-only agent task:
+Run one source-only agent task. Supported agents are `codex` and `openhands`:
 
 ```bash
 uv run cybergym-e2b run curl/arvo_66012 \
