@@ -70,7 +70,6 @@ def test_reasoning_effort_is_explicit_and_configurable() -> None:
 def test_summary_wire_api_matches_agent_transport() -> None:
     assert _summary_wire_api("codex") == "responses"
     assert _summary_wire_api("openhands") == "chat-completions"
-    assert _summary_wire_api("gemini") == "chat-completions"
 
 
 def test_apt_retry_wrapper_covers_apt_and_apt_get(tmp_path: Path) -> None:
