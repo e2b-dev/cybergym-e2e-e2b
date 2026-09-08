@@ -279,7 +279,9 @@ def _network(
     return network
 
 
-def _require_runnable_policy(policy: dict[str, Any], *, kind: str, egress: EgressMode) -> None:
+def _require_runnable_policy(
+    policy: dict[str, Any], *, kind: Literal["smoke", "run"], egress: EgressMode
+) -> None:
     """Agent runs install Node and the agent CLI at runtime; a model-only allowlist cannot."""
     if kind != "run" or egress == "permissive":
         return
@@ -601,7 +603,7 @@ def _route_template(manifest: TemplateManifest, *, project: str, build_image: st
 def _execution_context(
     resolved: ResolvedTask,
     *,
-    kind: str,
+    kind: Literal["smoke", "run"],
     options: RunOptions,
     manifest_path: Path,
     network_policy_path: Path,
@@ -867,11 +869,13 @@ def _collect(sandbox: Sandbox, destination: Path) -> None:
 
 
 def _result_member_filter(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo | None:
-    # Result archives never need links; dropping them removes the link-target attack
-    # surface and keeps a stray agent symlink from failing the whole collection.
-    if member.issym() or member.islnk():
+    # Keep in-tree links (cp -a plus tar emits hardlinks) but drop any member the data
+    # filter rejects, so a stray agent symlink to an outside path cannot escape the
+    # artifact root or fail collection of an otherwise complete run.
+    try:
+        return tarfile.data_filter(member, path)
+    except tarfile.FilterError:
         return None
-    return tarfile.data_filter(member, path)
 
 
 def _extract_results(archive_path: Path, root: Path) -> None:

@@ -163,8 +163,9 @@ before including them in a published comparison. `--egress restricted` uses a pu
 allowlist and also requires an audit. `--egress permissive` is diagnostic and is always ineligible.
 The packaged `network-locked.json` policy permits only the selected model endpoint during runtime.
 It is eligible without a public-egress audit only once agent tooling (Node, nvm, and Codex) is
-preloaded into the agent container. This release does not ship that preload, so agent runs under
-the locked policy fail during tooling install; use it only for diagnostics until then.
+preloaded into the agent container. This release does not ship that preload, so `run`, `batch
+--kind run`, and `preflight --kind run` refuse the locked policy before creating a sandbox.
+`smoke` still works under it.
 
 Runtime assets can be overridden with `--patch-file`, `--remote-smoke`,
 `--remote-install-codex`, and `--network-policy`. Overrides are included in the experiment

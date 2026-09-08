@@ -45,10 +45,10 @@ def test_patch_carries_context_and_applies_without_unidiff_zero() -> None:
 
 
 def _git_repo_with_commit(root: Path) -> str:
-    root.mkdir()
+    (root / "scripts").mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    (root / "tracked.txt").write_text("pinned\n")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+    (root / "scripts" / "validate.py").write_text("pinned\n")
+    subprocess.run(["git", "add", "scripts/validate.py"], cwd=root, check=True)
     subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-m", "pin"],
         cwd=root,
@@ -66,14 +66,25 @@ def test_verify_upstream_rejects_dirty_checkout(tmp_path: Path, monkeypatch) -> 
 
     assert _verify_upstream(repo) == head
 
-    (repo / "tracked.txt").write_text("edited validator\n")
+    # IDE metadata or notes outside the shipped trees must not block every command.
+    (repo / "notes.md").write_text("scratch\n")
+    assert _verify_upstream(repo) == head
+
+    (repo / "scripts" / "validate.py").write_text("edited validator\n")
     with pytest.raises(RuntimeError, match="dirty") as excinfo:
         _verify_upstream(repo)
-    # sync-upstream refuses dirty trees too, so the message must name a remedy that works.
-    assert "git clean" in str(excinfo.value)
+    # sync-upstream refuses dirty trees too, so the message must name a remedy that works,
+    # and every git step in it must target the vendored checkout, not the caller's repo.
+    assert f"git -C {repo} checkout -- ." in str(excinfo.value)
+    assert f"git -C {repo} clean -fd" in str(excinfo.value)
+
+    (repo / "scripts" / "validate.py").write_text("pinned\n")
+    (repo / "scripts" / "extra.py").write_text("untracked but shipped\n")
+    with pytest.raises(RuntimeError, match="dirty"):
+        _verify_upstream(repo)
 
 
-def _tarball(members: dict[str, bytes | Path]) -> bytes:
+def _tarball(members: dict[str, bytes | Path | tuple[str, str]]) -> bytes:
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for name, data in members.items():
@@ -81,6 +92,10 @@ def _tarball(members: dict[str, bytes | Path]) -> bytes:
             if isinstance(data, Path):
                 info.type = tarfile.SYMTYPE
                 info.linkname = str(data)
+                archive.addfile(info)
+            elif isinstance(data, tuple):
+                info.type = tarfile.LNKTYPE
+                info.linkname = data[1]
                 archive.addfile(info)
             else:
                 info.size = len(data)
@@ -103,20 +118,24 @@ def test_extract_results_extracts_nested_members(tmp_path: Path) -> None:
     assert (tmp_path / "sandbox" / "agent_output" / "run" / "log.txt").read_bytes() == b"ok"
 
 
-def test_extract_results_drops_link_members_and_keeps_files(tmp_path: Path) -> None:
+def test_extract_results_drops_unsafe_links_but_keeps_in_tree_links(tmp_path: Path) -> None:
     archive_path = tmp_path / "results.tgz"
     archive_path.write_bytes(
         _tarball(
             {
                 "./agent_output/fix.patch": Path("/etc/passwd"),
                 "./agent_output/summary.json": b"{}",
+                # GNU cp -a followed by tar emits the second hardlink name as LNKTYPE.
+                "./agent_output/summary-copy.json": ("hardlink", "./agent_output/summary.json"),
             }
         )
     )
     _extract_results(archive_path, tmp_path / "sandbox")
-    assert (tmp_path / "sandbox" / "agent_output" / "summary.json").read_bytes() == b"{}"
-    assert not (tmp_path / "sandbox" / "agent_output" / "fix.patch").is_symlink()
-    assert not (tmp_path / "sandbox" / "agent_output" / "fix.patch").exists()
+    out = tmp_path / "sandbox" / "agent_output"
+    assert (out / "summary.json").read_bytes() == b"{}"
+    assert (out / "summary-copy.json").read_bytes() == b"{}"
+    assert not (out / "fix.patch").is_symlink()
+    assert not (out / "fix.patch").exists()
 
 
 def test_gemini_cli_is_not_an_accepted_agent() -> None:
@@ -171,3 +190,23 @@ def test_cli_validates_asset_overrides_before_doing_work(tmp_path: Path, capsys)
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["type"] == "FileNotFoundError"
     assert "instal_codex.sh" in error["message"]
+
+
+def test_batch_refuses_unrunnable_policy_before_submitting_work(tmp_path: Path, capsys) -> None:
+    tasks = tmp_path / "tasks.txt"
+    tasks.write_text("curl/arvo_66012\n")
+    code = main(
+        [
+            "batch",
+            "--kind",
+            "run",
+            "--tasks-file",
+            str(tasks),
+            "--network-policy",
+            str(LOCKED_POLICY),
+        ]
+    )
+    assert code == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["type"] == "ValueError"
+    assert "agent tooling" in error["message"]

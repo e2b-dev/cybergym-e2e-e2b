@@ -44,6 +44,8 @@ from cybergym_e2b.runtime import (
     _execution_context,
     _experiment_identity,
     _network_eligibility,
+    _policy,
+    _require_runnable_policy,
     execute_task,
     preflight_access,
 )
@@ -202,13 +204,19 @@ def _verify_upstream(path: Path) -> str:
     ).stdout.strip()
     if commit != UPSTREAM_COMMIT:
         raise RuntimeError(f"upstream checkout is {commit}, expected {UPSTREAM_COMMIT}")
+    # Only the trees that ship to the sandbox matter; IDE metadata elsewhere is harmless.
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=path, check=True, capture_output=True, text=True
+        ["git", "status", "--porcelain", "--", "scripts", "projects"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     if status:
         raise RuntimeError(
             f"upstream checkout is dirty: {path}; discard local changes with "
-            f"`git -C {path} checkout -- . && git clean -fd` or delete it and rerun sync-upstream"
+            f"`git -C {path} checkout -- . && git -C {path} clean -fd` "
+            "or delete it and rerun sync-upstream"
         )
     return commit
 
@@ -338,9 +346,11 @@ def _already_completed(artifacts_dir: Path, task: str, experiment_sha256: str) -
 def _batch(args: argparse.Namespace) -> dict:
     if not 1 <= args.concurrency <= 180:
         raise ValueError("concurrency must be between 1 and 180")
+    options = _options(args)
+    # Reject an unrunnable policy once, before any task is resolved or submitted.
+    _require_runnable_policy(_policy(args.network_policy), kind=args.kind, egress=options.egress)
     requested = _tasks(args)
     image_map = load_image_map(args.image_map, upstream=args.upstream)
-    options = _options(args)
     manifest = TemplateManifest.load(args.manifest)
     work: list[tuple[str, ResolvedTask, dict]] = []
     for task in requested:
