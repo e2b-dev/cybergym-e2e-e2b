@@ -192,7 +192,11 @@ def test_cli_validates_asset_overrides_before_doing_work(tmp_path: Path, capsys)
     assert "instal_codex.sh" in error["message"]
 
 
-def test_batch_refuses_unrunnable_policy_before_submitting_work(tmp_path: Path, capsys) -> None:
+def test_batch_refuses_unrunnable_policy_before_submitting_work(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    # main() requires the E2B key before dispatching to batch; keep the test hermetic.
+    monkeypatch.setenv("E2B_API_KEY", "test-key")
     tasks = tmp_path / "tasks.txt"
     tasks.write_text("curl/arvo_66012\n")
     code = main(
