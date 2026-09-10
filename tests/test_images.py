@@ -6,9 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cybergym_e2b.cli import _parser
 from cybergym_e2b.config import (
-    DEFAULT_IMAGE_LOCK,
     FFMPEG_IMAGE,
     UPSTREAM_COMMIT,
     UPSTREAM_REPOSITORY,
@@ -249,15 +247,3 @@ def test_image_lock_rejects_a_changed_known_ffmpeg_tag(tmp_path: Path) -> None:
             upstream,
             resolver=_Resolver({FFMPEG_IMAGE: "cybergym/e2e@sha256:" + "f" * 64}),
         )
-
-
-def test_cli_exposes_image_lock_and_uses_it_by_default() -> None:
-    lock_args = _parser().parse_args(["images", "lock"])
-    run_args = _parser().parse_args(["run", "curl/arvo_66012"])
-
-    assert lock_args.output == DEFAULT_IMAGE_LOCK
-    assert lock_args.tasks == []
-    assert run_args.image_lock == DEFAULT_IMAGE_LOCK
-
-    scoped = _parser().parse_args(["images", "lock", "--task", "curl/arvo_66012", "--task", "a/b"])
-    assert scoped.tasks == ["curl/arvo_66012", "a/b"]

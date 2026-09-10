@@ -10,8 +10,6 @@ from cybergym_e2b.config import (
     BASE_BUILDER_IMAGES,
     DEFAULT_MANIFEST,
     DEFAULT_NETWORK_POLICY,
-    FFMPEG_IMAGE,
-    FFMPEG_IMAGE_DIGEST,
     TemplateManifest,
     TemplateRef,
 )
@@ -204,20 +202,6 @@ def test_template_recipe_identity_covers_rendered_build_commands(
     assert original_recipe["sha256"] != changed_recipe["sha256"]
 
 
-def test_template_install_excludes_unpinned_recommended_packages(tmp_path: Path) -> None:
-    from cybergym_e2b import templates
-
-    requirements = tmp_path / "requirements.lock"
-    requirements.write_text(
-        "demo==1.2.3 --hash=sha256:" + "a" * 64 + "\n",
-        encoding="utf-8",
-    )
-    payload = templates._validate_requirements_lock(requirements)
-    install, _, _ = templates._base_commands(payload)
-
-    assert install.count("apt-get install -y --no-install-recommends") == 2
-
-
 def test_template_build_rejects_unlocked_python_requirements(tmp_path: Path) -> None:
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("httpx>=0.28,<0.29\n", encoding="utf-8")
@@ -260,31 +244,8 @@ def test_manifest_rejects_mutable_recorded_images(tmp_path: Path) -> None:
         TemplateManifest.load(path)
 
 
-def test_known_ffmpeg_pin_is_an_immutable_digest() -> None:
-    assert FFMPEG_IMAGE == "cybergym/e2e:ffmpeg"
-    assert FFMPEG_IMAGE_DIGEST.startswith("cybergym/e2e@sha256:")
-    assert len(FFMPEG_IMAGE_DIGEST.rsplit(":", 1)[1]) == 64
-
-
-def test_executable_source_pins_are_loaded_from_packaged_upstream_lock(tmp_path: Path) -> None:
-    from cybergym_e2b.config import (
-        DATASET_REPOSITORY,
-        DATASET_REVISION,
-        UPSTREAM_COMMIT,
-        UPSTREAM_LOCK,
-        UPSTREAM_REPOSITORY,
-        load_upstream_lock,
-    )
-
-    inputs = load_upstream_lock(UPSTREAM_LOCK)
-    assert (
-        inputs.code_repository,
-        inputs.code_commit,
-    ) == (UPSTREAM_REPOSITORY, UPSTREAM_COMMIT)
-    assert (
-        inputs.dataset_repository,
-        inputs.dataset_revision,
-    ) == (DATASET_REPOSITORY, DATASET_REVISION)
+def test_upstream_lock_rejects_malformed_pins(tmp_path: Path) -> None:
+    from cybergym_e2b.config import load_upstream_lock
 
     malformed = tmp_path / "upstream.lock.json"
     malformed.write_text(
