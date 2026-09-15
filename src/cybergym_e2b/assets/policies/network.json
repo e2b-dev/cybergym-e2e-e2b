@@ -11,7 +11,8 @@
   ],
   "model_hosts": [
     "api.fireworks.ai",
-    "bedrock-mantle.*.api.aws"
+    "bedrock-mantle.*.api.aws",
+    "api.openai.com"
   ],
   "artifact_hosts": [
     "huggingface.co",

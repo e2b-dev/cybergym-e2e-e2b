@@ -15,13 +15,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from cybergym_e2b.agents import AGENTS
 from cybergym_e2b.cli import _already_completed, _batch, _verify_upstream, main
 from cybergym_e2b.config import (
     BASE_BUILDER_IMAGES,
     DEFAULT_NETWORK_POLICY,
     DEFAULT_PATCH_FILE,
     DEFAULT_REMOTE_APT_RETRY,
-    DEFAULT_REMOTE_INSTALL_CODEX,
     DEFAULT_REMOTE_SMOKE,
     FFMPEG_IMAGE,
     FFMPEG_IMAGE_DIGEST,
@@ -36,7 +36,6 @@ from cybergym_e2b.inventory import build_code_bundle, inventory, load_image_map,
 from cybergym_e2b.runtime import (
     COLLECTION_RESERVE_SECONDS,
     RunOptions,
-    _agent_model_id,
     _assert_image_identity,
     _benchmark_result,
     _execution_context,
@@ -186,11 +185,11 @@ def test_network_credentials_are_scoped_to_their_phase() -> None:
 def test_bedrock_routes_codex_to_responses_and_openhands_to_chat_completions() -> None:
     codex = RunOptions(provider="bedrock", model="openai.gpt-5.4")
     assert _model_config(codex)["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
-    assert _agent_model_id(codex) == "openai.gpt-5.4"
+    assert AGENTS["codex"].model_id(codex.model) == "openai.gpt-5.4"
 
     openhands = replace(codex, agent="openhands", model="deepseek.v3.2")
     assert _model_config(openhands)["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/v1"
-    assert _agent_model_id(openhands) == "openai/deepseek.v3.2"
+    assert AGENTS["openhands"].model_id(openhands.model) == "openai/deepseek.v3.2"
 
 
 def test_network_policy_rejects_unsupported_deny_cidrs(tmp_path: Path) -> None:
@@ -259,13 +258,15 @@ def test_image_lock_accepts_only_digest_locked_values(tmp_path: Path) -> None:
 
 
 def test_bundle_is_task_scoped_and_applies_provider_patch() -> None:
-    assert "if ! command -v curl" in DEFAULT_REMOTE_INSTALL_CODEX.read_text()
+    codex_scripts = AGENTS["codex"].bundle_scripts
+    assert "if ! command -v curl" in codex_scripts["install_codex.sh"].read_text()
     resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
     payload = build_code_bundle(
         UPSTREAM,
         resolved,
         patch_file=DEFAULT_PATCH_FILE,
         remote_smoke=DEFAULT_REMOTE_SMOKE,
+        scripts=codex_scripts,
     )
     with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as archive:
         names = set(archive.getnames())
@@ -662,7 +663,7 @@ def test_batch_accounts_for_every_submitted_future_after_fail_fast(
         network_policy=DEFAULT_NETWORK_POLICY,
         patch_file=DEFAULT_PATCH_FILE,
         remote_smoke=DEFAULT_REMOTE_SMOKE,
-        remote_install_codex=DEFAULT_REMOTE_SMOKE,
+        bundle_scripts=[],
         setup_timeout=1,
         evaluation_timeout=1,
         min_free_gb=1,
@@ -676,7 +677,9 @@ def test_batch_accounts_for_every_submitted_future_after_fail_fast(
         max_attempts=1,
         agent_timeout=1,
         provider="bedrock",
-        bedrock_region="us-west-2",
+        model_region="us-west-2",
+        model_base_url=None,
+        model_key_env=None,
     )
 
     summary = _batch(args)
@@ -1088,17 +1091,17 @@ def test_packaged_policies_share_host_lists() -> None:
 
 def test_locked_policy_refuses_agent_runs_but_allows_smoke() -> None:
     locked = _policy(LOCKED_POLICY)
-    with pytest.raises(ValueError, match="agent tooling"):
-        _require_runnable_policy(locked, kind="run", egress="policy")
-    _require_runnable_policy(locked, kind="smoke", egress="policy")
+    with pytest.raises(ValueError, match="installs its tooling"):
+        _require_runnable_policy(locked, kind="run", egress="policy", agent_name="codex")
+    _require_runnable_policy(locked, kind="smoke", egress="policy", agent_name="codex")
     default = _policy(DEFAULT_NETWORK_POLICY)
-    _require_runnable_policy(default, kind="run", egress="policy")
-    _require_runnable_policy(default, kind="run", egress="restricted")
+    _require_runnable_policy(default, kind="run", egress="policy", agent_name="codex")
+    _require_runnable_policy(default, kind="run", egress="restricted", agent_name="codex")
 
 
 def test_cli_validates_asset_overrides_before_doing_work(tmp_path: Path, capsys) -> None:
     missing = tmp_path / "instal_codex.sh"
-    code = main(["preflight", "--remote-install-codex", str(missing)])
+    code = main(["preflight", "--bundle-script", f"install_codex.sh={missing}"])
     assert code == 1
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["type"] == "FileNotFoundError"
@@ -1126,4 +1129,4 @@ def test_batch_refuses_unrunnable_policy_before_submitting_work(
     assert code == 1
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["type"] == "ValueError"
-    assert "agent tooling" in error["message"]
+    assert "installs its tooling" in error["message"]
