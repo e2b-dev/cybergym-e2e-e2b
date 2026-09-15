@@ -86,6 +86,7 @@ jobs:
           uv run --locked --python 3.13 twine check dist/*
           unzip -l dist/*.whl | grep -F 'licenses/LICENSE'
           unzip -l dist/*.whl | grep -F 'cybergym_e2b/assets/remote/e2b_smoke.py'
+          tar -tzf dist/*.tar.gz | grep -F '/.env.example'
 
       - name: Verify installed CLI outside the checkout
         run: |

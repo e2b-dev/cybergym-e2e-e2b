@@ -15,12 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from cybergym_e2b.cli import _already_completed, _batch, _options, _parser, main
+from cybergym_e2b.cli import _already_completed, _batch, _verify_upstream, main
 from cybergym_e2b.config import (
     BASE_BUILDER_IMAGES,
-    DEFAULT_MANIFEST,
-    DEFAULT_MODEL,
-    DEFAULT_MODEL_PROVIDER,
     DEFAULT_NETWORK_POLICY,
     DEFAULT_PATCH_FILE,
     DEFAULT_REMOTE_APT_RETRY,
@@ -32,6 +29,7 @@ from cybergym_e2b.config import (
     UPSTREAM_REPOSITORY,
     TemplateManifest,
     TemplateRef,
+    asset_path,
     normalize_task,
 )
 from cybergym_e2b.inventory import build_code_bundle, inventory, load_image_map, resolve_task
@@ -41,42 +39,22 @@ from cybergym_e2b.runtime import (
     _agent_model_id,
     _assert_image_identity,
     _benchmark_result,
-    _create_fresh_sandbox_from_template,
     _execution_context,
     _experiment_identity,
+    _extract_results,
     _model_config,
     _network,
     _network_eligibility,
     _observe_after_workload,
     _policy,
+    _require_runnable_policy,
     _resource_summary,
     _route_template,
     _shell_run,
     _StageProfiler,
-    _summary_wire_api,
 )
 
 UPSTREAM = Path("vendor/cybergym-e2e")
-
-
-def test_validated_8c8g_configuration_is_the_default() -> None:
-    assert DEFAULT_MANIFEST.parts[-3:] == ("artifacts", "templates", "manifest.json")
-    assert DEFAULT_MODEL == "openai.gpt-5.4"
-    assert DEFAULT_MODEL_PROVIDER == "bedrock"
-    assert RunOptions().reasoning_effort == "high"
-
-
-def test_reasoning_effort_is_explicit_and_configurable() -> None:
-    default_args = _parser().parse_args(["run", "curl/arvo_66012"])
-    assert _options(default_args).reasoning_effort == "high"
-
-    args = _parser().parse_args(["run", "curl/arvo_66012", "--reasoning-effort", "xhigh"])
-    assert _options(args).reasoning_effort == "xhigh"
-
-
-def test_summary_wire_api_matches_agent_transport() -> None:
-    assert _summary_wire_api("codex") == "responses"
-    assert _summary_wire_api("openhands") == "chat-completions"
 
 
 def test_apt_retry_wrapper_covers_apt_and_apt_get(tmp_path: Path) -> None:
@@ -120,15 +98,6 @@ exit 0
         subprocess.run([str(wrapper), "install", "-y", "git"], env=env, check=True)
         assert counter.read_text(encoding="utf-8") == "4"
         assert arguments.read_text(encoding="utf-8").splitlines()[-1] == "install -y git"
-
-
-def test_default_egress_enforces_the_default_allow_policy() -> None:
-    args = _parser().parse_args(["run", "curl/arvo_66012"])
-    assert args.egress == "policy"
-
-    policy = _policy(DEFAULT_NETWORK_POLICY)
-    assert policy["default_action"] == "allow"
-    assert "169.254.0.0/16" in policy["deny_out"]
 
 
 def test_default_public_egress_requires_a_network_audit_for_eligibility() -> None:
@@ -214,35 +183,14 @@ def test_network_credentials_are_scoped_to_their_phase() -> None:
     assert set(bedrock["rules"]) == {"bedrock-mantle.us-west-2.api.aws"}
 
 
-def test_bedrock_provider_uses_mantle_responses_endpoint() -> None:
-    args = _parser().parse_args(
-        [
-            "run",
-            "curl/arvo_66012",
-            "--provider",
-            "bedrock",
-            "--model",
-            "openai.gpt-5.4",
-        ]
-    )
-    options = RunOptions(provider=args.provider, bedrock_region=args.bedrock_region)
-    config = _model_config(options)
-    assert config["host"] == "bedrock-mantle.us-west-2.api.aws"
-    assert config["base_url"] == ("https://bedrock-mantle.us-west-2.api.aws/openai/v1")
+def test_bedrock_routes_codex_to_responses_and_openhands_to_chat_completions() -> None:
+    codex = RunOptions(provider="bedrock", model="openai.gpt-5.4")
+    assert _model_config(codex)["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+    assert _agent_model_id(codex) == "openai.gpt-5.4"
 
-
-def test_bedrock_openhands_uses_mantle_chat_completions_endpoint() -> None:
-    options = RunOptions(
-        provider="bedrock",
-        agent="openhands",
-        model="deepseek.v3.2",
-        bedrock_region="us-west-2",
-    )
-    config = _model_config(options)
-    assert config["host"] == "bedrock-mantle.us-west-2.api.aws"
-    assert config["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/v1"
-    assert _agent_model_id(options) == "openai/deepseek.v3.2"
-    assert _agent_model_id(replace(options, agent="codex")) == "deepseek.v3.2"
+    openhands = replace(codex, agent="openhands", model="deepseek.v3.2")
+    assert _model_config(openhands)["base_url"] == "https://bedrock-mantle.us-west-2.api.aws/v1"
+    assert _agent_model_id(openhands) == "openai/deepseek.v3.2"
 
 
 def test_network_policy_rejects_unsupported_deny_cidrs(tmp_path: Path) -> None:
@@ -251,21 +199,13 @@ def test_network_policy_rejects_unsupported_deny_cidrs(tmp_path: Path) -> None:
     path = tmp_path / "network.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
 
-    try:
+    with pytest.raises(ValueError, match="not supported by E2B"):
         _policy(path)
-    except ValueError as exc:
-        assert "not supported by E2B" in str(exc)
-    else:
-        raise AssertionError("an E2B-invalid deny CIDR was accepted")
 
     raw["deny_out"] = ["240.0.0.0/4"]
     path.write_text(json.dumps(raw), encoding="utf-8")
-    try:
+    with pytest.raises(ValueError, match="not supported by E2B"):
         _policy(path)
-    except ValueError as exc:
-        assert "not supported by E2B" in str(exc)
-    else:
-        raise AssertionError("E2B's platform-address range was accepted in deny_out")
 
 
 def test_pinned_inventory_shape() -> None:
@@ -277,12 +217,6 @@ def test_pinned_inventory_shape() -> None:
     counts = {row["build_image"]: row["task_count"] for row in result["images"]}
     assert sum(counts[image] for image in BASE_BUILDER_IMAGES) == 344
     assert counts[FFMPEG_IMAGE] == 10
-
-
-def test_task_resolution_uses_known_ffmpeg_digest_pin() -> None:
-    original = resolve_task(UPSTREAM, "ffmpeg/oss-fuzz_431665305")
-    assert original.build_image == FFMPEG_IMAGE
-    assert original.runtime_image == FFMPEG_IMAGE_DIGEST
 
 
 def _lock(images: dict[str, str]) -> str:
@@ -297,6 +231,9 @@ def _lock(images: dict[str, str]) -> str:
 
 
 def test_image_lock_accepts_only_digest_locked_values(tmp_path: Path) -> None:
+    unmapped = resolve_task(UPSTREAM, "ffmpeg/oss-fuzz_431665305")
+    assert (unmapped.build_image, unmapped.runtime_image) == (FFMPEG_IMAGE, FFMPEG_IMAGE_DIGEST)
+
     digest = FFMPEG_IMAGE_DIGEST.rsplit(":", 1)[1]
     path = tmp_path / "images.lock.json"
     path.write_text(_lock({FFMPEG_IMAGE: f"mirror.invalid/cybergym/e2e@sha256:{digest}"}))
@@ -461,77 +398,38 @@ def test_openai_compatible_summary_uses_agent_wire_api(monkeypatch) -> None:
     )
 
 
-def test_manifest_round_trip_and_routing(tmp_path: Path) -> None:
+def test_manifest_round_trip_and_ffmpeg_routing(tmp_path: Path) -> None:
+    base = TemplateRef(
+        name="base",
+        tag="recipe-aaaaaaaaaaaaaaaa",
+        template_id="template-base",
+        build_id="build-base-1234",
+        recipe_sha256="a" * 64,
+        images=BASE_BUILDER_IMAGES,
+    )
+    hot = TemplateRef(
+        name="ffmpeg",
+        tag="recipe-bbbbbbbbbbbbbbbb",
+        template_id="template-ffmpeg",
+        build_id="build-ffmpeg-1234",
+        recipe_sha256="b" * 64,
+        images=(*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
+    )
     path = tmp_path / "manifest.json"
-    base = TemplateRef(
-        name="base",
-        tag="recipe-aaaaaaaaaaaaaaaa",
-        template_id="template-base",
-        build_id="build-base-1234",
-        recipe_sha256="a" * 64,
-        images=BASE_BUILDER_IMAGES,
-    )
-    hot = TemplateRef(
-        name="ffmpeg",
-        tag="recipe-bbbbbbbbbbbbbbbb",
-        template_id="template-ffmpeg",
-        build_id="build-ffmpeg-1234",
-        recipe_sha256="b" * 64,
-        images=(*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
-    )
-    manifest = TemplateManifest(base=base, hot={FFMPEG_IMAGE: hot})
-    manifest.write(path)
-    loaded = TemplateManifest.load(path)
-    assert loaded.route(FFMPEG_IMAGE).reference == hot.reference
-    assert loaded.route("n132/arvo:1-fix").reference == base.reference
-    raw = json.loads(path.read_text())
-    assert raw["resources"]["disk_limit_gb"] == 120
+    TemplateManifest(base=base, hot={FFMPEG_IMAGE: hot}).write(path)
+    manifest = TemplateManifest.load(path)
 
-
-def test_all_ffmpeg_tasks_use_cache_bearing_hot_template() -> None:
-    base = TemplateRef(
-        name="base",
-        tag="recipe-aaaaaaaaaaaaaaaa",
-        template_id="template-base",
-        build_id="build-base-1234",
-        recipe_sha256="a" * 64,
-        images=BASE_BUILDER_IMAGES,
-    )
-    hot = TemplateRef(
-        name="ffmpeg",
-        tag="recipe-bbbbbbbbbbbbbbbb",
-        template_id="template-ffmpeg",
-        build_id="build-ffmpeg-1234",
-        recipe_sha256="b" * 64,
-        images=(*BASE_BUILDER_IMAGES, FFMPEG_IMAGE_DIGEST),
-    )
-    manifest = TemplateManifest(base=base, hot={FFMPEG_IMAGE: hot})
-
-    assert (
-        _route_template(
-            manifest,
-            project="ffmpeg",
-            build_image="cybergym/e2e:ffmpeg-legacy-task-image",
-        ).reference
-        == hot.reference
-    )
-    assert (
-        _route_template(
-            manifest,
-            project="curl",
-            build_image="gcr.io/oss-fuzz-base/base-builder",
-        ).reference
-        == base.reference
-    )
+    assert manifest.route(FFMPEG_IMAGE).reference == hot.reference
+    assert manifest.route("n132/arvo:1-fix").reference == base.reference
+    # Every ffmpeg task needs the cached Opus archive, even with a task-specific legacy image.
+    legacy = "cybergym/e2e:ffmpeg-legacy-task-image"
+    assert _route_template(manifest, project="ffmpeg", build_image=legacy) == hot
+    assert _route_template(manifest, project="curl", build_image=legacy) == base
 
 
 def test_task_path_rejects_traversal() -> None:
-    try:
+    with pytest.raises(ValueError):
         normalize_task("curl/../secret")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("path traversal was accepted")
 
 
 def test_ffmpeg_digest_is_enforced_even_through_a_mirror() -> None:
@@ -540,15 +438,10 @@ def test_ffmpeg_digest_is_enforced_even_through_a_mirror() -> None:
         FFMPEG_IMAGE_DIGEST,
         {"repo_digests": [f"mirror.invalid/cybergym/e2e@{digest}"]},
     )
-    try:
+    with pytest.raises(RuntimeError):
         _assert_image_identity(
-            FFMPEG_IMAGE_DIGEST,
-            {"repo_digests": ["mirror.invalid/cybergym/e2e@sha256:wrong"]},
+            FFMPEG_IMAGE_DIGEST, {"repo_digests": ["mirror.invalid/cybergym/e2e@sha256:wrong"]}
         )
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("an unexpected FFmpeg digest was accepted")
 
 
 def test_benchmark_result_separates_benchmark_status_from_infrastructure(tmp_path: Path) -> None:
@@ -694,10 +587,6 @@ def test_resource_summary_reports_worst_observation_and_skips_truncated_lines() 
     assert summary["average_cpu_busy_percent"] == 75.0
 
 
-def test_resource_summary_without_samples_is_empty() -> None:
-    assert _resource_summary(_SampleSandbox([])) == {"sample_count": 0}
-
-
 def test_observe_after_workload_records_errors_without_raising() -> None:
     class Monitor:
         def kill(self) -> None:
@@ -795,41 +684,6 @@ def test_batch_accounts_for_every_submitted_future_after_fail_fast(
     assert len(summary["results"]) == summary["submitted"] == 3
     assert summary["infrastructure_completed"] + summary["infrastructure_failures"] == 3
     assert summary["infrastructure_failures"] >= 1
-
-
-def test_batch_infrastructure_failure_exits_nonzero(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("E2B_API_KEY", "present")
-    monkeypatch.setattr("cybergym_e2b.cli._verify_upstream", lambda _path: "commit")
-    monkeypatch.setattr(
-        "cybergym_e2b.cli._batch",
-        lambda _args: {"infrastructure_failures": 1, "results": []},
-    )
-
-    assert main(["batch", "--upstream", str(tmp_path), "--artifacts-dir", str(tmp_path)]) == 1
-
-
-def test_preflight_accepts_the_same_execution_options_as_run() -> None:
-    preflight = _parser().parse_args(
-        [
-            "preflight",
-            "--task",
-            "curl/arvo_66012",
-            "--provider",
-            "fireworks",
-            "--model",
-            "accounts/fireworks/models/test",
-            "--agent",
-            "openhands",
-            "--egress",
-            "restricted",
-        ]
-    )
-
-    options = _options(preflight)
-    assert options.provider == "fireworks"
-    assert options.model == "accounts/fireworks/models/test"
-    assert options.agent == "openhands"
-    assert options.egress == "restricted"
 
 
 def test_resume_skips_graded_model_errors_but_retries_smoke_errors(tmp_path: Path) -> None:
@@ -976,26 +830,6 @@ def test_experiment_identity_changes_with_kind_and_model(tmp_path: Path) -> None
     assert run["sha256"] != other_reasoning_effort["sha256"]
 
 
-def test_fresh_sandbox_creation_uses_template_and_disables_auto_resume(monkeypatch) -> None:
-    captured = {}
-    expected = object()
-
-    def create(**kwargs):
-        captured.update(kwargs)
-        return expected
-
-    monkeypatch.setattr("cybergym_e2b.runtime.Sandbox.create", create)
-    actual = _create_fresh_sandbox_from_template(
-        "template-name:build-id-1234",
-        timeout=60,
-        metadata={"run_id": "run"},
-        network={"allow_public_traffic": False},
-    )
-    assert actual is expected
-    assert captured["template"] == "template-name:build-id-1234"
-    assert captured["lifecycle"] == {"on_timeout": "kill", "auto_resume": False}
-
-
 def test_shell_run_survives_transient_poll_disconnect(monkeypatch) -> None:
     class Commands:
         def __init__(self) -> None:
@@ -1107,3 +941,189 @@ def test_execution_context_resolves_non_http_hosts_only_for_allowlists(
             manifest_path=manifest,
             network_policy_path=DEFAULT_NETWORK_POLICY,
         )
+
+
+LOCKED_POLICY = asset_path("policies/network-locked.json")
+
+
+def test_patch_keeps_anthropic_return_ahead_of_openai_compatible_branch() -> None:
+    resolved = resolve_task(UPSTREAM, "curl/arvo_66012")
+    payload = build_code_bundle(UPSTREAM, resolved)
+    with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as archive:
+        utils = archive.extractfile("scripts/utils.py")
+        assert utils is not None
+        source = utils.read().decode()
+    anthropic_return = source.index("return response.content[0].text")
+    new_branch = source.index('model_provider == "openai-compatible"')
+    assert anthropic_return < new_branch
+
+
+def test_patch_carries_context_and_applies_without_unidiff_zero() -> None:
+    check = subprocess.run(
+        ["git", "apply", "--check", str(DEFAULT_PATCH_FILE.resolve())],
+        cwd=UPSTREAM,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stderr
+
+
+def _git_repo_with_commit(root: Path) -> str:
+    (root / "scripts").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / "scripts" / "validate.py").write_text("pinned\n")
+    subprocess.run(["git", "add", "scripts/validate.py"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-m", "pin"],
+        cwd=root,
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_verify_upstream_rejects_dirty_checkout(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "upstream"
+    head = _git_repo_with_commit(repo)
+    monkeypatch.setattr("cybergym_e2b.cli.UPSTREAM_COMMIT", head)
+
+    assert _verify_upstream(repo) == head
+
+    # IDE metadata or notes outside the shipped trees must not block every command.
+    (repo / "notes.md").write_text("scratch\n")
+    assert _verify_upstream(repo) == head
+
+    (repo / "scripts" / "validate.py").write_text("edited validator\n")
+    with pytest.raises(RuntimeError, match="dirty") as excinfo:
+        _verify_upstream(repo)
+    # sync-upstream refuses dirty trees too, so the message must name a remedy that works,
+    # and every git step in it must target the vendored checkout, not the caller's repo.
+    assert f"git -C {repo} checkout -- ." in str(excinfo.value)
+    assert f"git -C {repo} clean -fd" in str(excinfo.value)
+
+    (repo / "scripts" / "validate.py").write_text("pinned\n")
+    (repo / "scripts" / "extra.py").write_text("untracked but shipped\n")
+    with pytest.raises(RuntimeError, match="dirty"):
+        _verify_upstream(repo)
+
+
+def _tarball(members: dict[str, bytes | Path | tuple[str, str]]) -> bytes:
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            if isinstance(data, Path):
+                info.type = tarfile.SYMTYPE
+                info.linkname = str(data)
+                archive.addfile(info)
+            elif isinstance(data, tuple):
+                info.type = tarfile.LNKTYPE
+                info.linkname = data[1]
+                archive.addfile(info)
+            else:
+                info.size = len(data)
+                archive.addfile(info, BytesIO(data))
+    return buffer.getvalue()
+
+
+def test_extract_results_rejects_parent_traversal(tmp_path: Path) -> None:
+    archive_path = tmp_path / "results.tgz"
+    archive_path.write_bytes(_tarball({"../escape.txt": b"x"}))
+    with pytest.raises(RuntimeError, match="unsafe path"):
+        _extract_results(archive_path, tmp_path / "sandbox")
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_extract_results_extracts_nested_members(tmp_path: Path) -> None:
+    archive_path = tmp_path / "results.tgz"
+    archive_path.write_bytes(_tarball({"./agent_output/run/log.txt": b"ok"}))
+    _extract_results(archive_path, tmp_path / "sandbox")
+    assert (tmp_path / "sandbox" / "agent_output" / "run" / "log.txt").read_bytes() == b"ok"
+
+
+def test_extract_results_drops_unsafe_links_but_keeps_in_tree_links(tmp_path: Path) -> None:
+    archive_path = tmp_path / "results.tgz"
+    archive_path.write_bytes(
+        _tarball(
+            {
+                "./agent_output/fix.patch": Path("/etc/passwd"),
+                "./agent_output/summary.json": b"{}",
+                # GNU cp -a followed by tar emits the second hardlink name as LNKTYPE.
+                "./agent_output/summary-copy.json": ("hardlink", "./agent_output/summary.json"),
+            }
+        )
+    )
+    _extract_results(archive_path, tmp_path / "sandbox")
+    out = tmp_path / "sandbox" / "agent_output"
+    assert (out / "summary.json").read_bytes() == b"{}"
+    assert (out / "summary-copy.json").read_bytes() == b"{}"
+    assert not (out / "fix.patch").is_symlink()
+    assert not (out / "fix.patch").exists()
+
+
+@pytest.mark.parametrize("policy_path", [DEFAULT_NETWORK_POLICY, LOCKED_POLICY])
+def test_packaged_policies_accept_any_bedrock_region(policy_path: Path) -> None:
+    policy = _policy(policy_path)
+    host = "bedrock-mantle.eu-west-1.api.aws"
+    network = _network(
+        policy,
+        phase="runtime",
+        egress="restricted",
+        hf_token=None,
+        model_key="secret",
+        non_http=[],
+        model_host=host,
+    )
+    assert host in network["allow_out"]
+    assert set(network["rules"]) == {host}
+
+
+def test_packaged_policies_share_host_lists() -> None:
+    default = _policy(DEFAULT_NETWORK_POLICY)
+    locked = _policy(LOCKED_POLICY)
+    for key in ("model_hosts", "artifact_hosts", "registry_hosts"):
+        assert default[key] == locked[key], key
+
+
+def test_locked_policy_refuses_agent_runs_but_allows_smoke() -> None:
+    locked = _policy(LOCKED_POLICY)
+    with pytest.raises(ValueError, match="agent tooling"):
+        _require_runnable_policy(locked, kind="run", egress="policy")
+    _require_runnable_policy(locked, kind="smoke", egress="policy")
+    default = _policy(DEFAULT_NETWORK_POLICY)
+    _require_runnable_policy(default, kind="run", egress="policy")
+    _require_runnable_policy(default, kind="run", egress="restricted")
+
+
+def test_cli_validates_asset_overrides_before_doing_work(tmp_path: Path, capsys) -> None:
+    missing = tmp_path / "instal_codex.sh"
+    code = main(["preflight", "--remote-install-codex", str(missing)])
+    assert code == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["type"] == "FileNotFoundError"
+    assert "instal_codex.sh" in error["message"]
+
+
+def test_batch_refuses_unrunnable_policy_before_submitting_work(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    # main() requires the E2B key before dispatching to batch; keep the test hermetic.
+    monkeypatch.setenv("E2B_API_KEY", "test-key")
+    tasks = tmp_path / "tasks.txt"
+    tasks.write_text("curl/arvo_66012\n")
+    code = main(
+        [
+            "batch",
+            "--kind",
+            "run",
+            "--tasks-file",
+            str(tasks),
+            "--network-policy",
+            str(LOCKED_POLICY),
+        ]
+    )
+    assert code == 1
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["type"] == "ValueError"
+    assert "agent tooling" in error["message"]

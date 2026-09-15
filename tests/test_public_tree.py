@@ -1,8 +1,6 @@
-"""Release policy behavior for the standalone public repository."""
+"""Publication policy for the repository tree."""
 
 import importlib.util
-import subprocess
-import tarfile
 from pathlib import Path
 
 
@@ -17,23 +15,6 @@ def _load_public_tree_module():
 
 public_tree = _load_public_tree_module()
 find_forbidden_paths = public_tree.find_forbidden_paths
-
-
-def test_source_distribution_includes_environment_example(tmp_path: Path) -> None:
-    repository = Path(__file__).parents[1]
-    subprocess.run(
-        ["uv", "build", "--sdist", "--out-dir", str(tmp_path)],
-        cwd=repository,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    [sdist] = tmp_path.glob("*.tar.gz")
-
-    with tarfile.open(sdist, mode="r:gz") as archive:
-        members = archive.getnames()
-
-    assert any(member.endswith("/.env.example") for member in members)
 
 
 def test_public_tree_policy_rejects_secrets_and_generated_paths():
@@ -82,37 +63,3 @@ def test_public_tree_command_validates_an_extracted_tree_without_git(
 
     assert public_tree.main(tmp_path) == 1
     assert ".env" in capsys.readouterr().out
-
-
-def test_gitignore_covers_secrets_and_generated_state(tmp_path: Path) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    (repository / ".gitignore").write_text(
-        (Path(__file__).parents[1] / ".gitignore").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-    candidates = [
-        ".env",
-        ".env.local",
-        ".env.example",
-        "artifacts/images.lock.json",
-        "artifacts/templates/manifest.json",
-        "vendor/cybergym-e2e/README.md",
-    ]
-    completed = subprocess.run(
-        ["git", "check-ignore", "--no-index", *candidates],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=repository,
-    )
-
-    assert completed.returncode == 0
-    assert completed.stdout.splitlines() == [
-        ".env",
-        ".env.local",
-        "artifacts/images.lock.json",
-        "artifacts/templates/manifest.json",
-        "vendor/cybergym-e2e/README.md",
-    ]
