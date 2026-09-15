@@ -5,8 +5,10 @@
 and S1–S4 validators with a small compatibility patch. Source-only end-to-end mode only; the
 classic binary-only CyberGym is a different project.
 
-Agents: `codex`, `openhands`. Providers: Fireworks or Amazon Bedrock (Mantle), via their
-OpenAI-compatible endpoints. See [Deviations from upstream](#deviations-from-upstream).
+Agents: `codex`, `openhands`. Providers: Fireworks, Amazon Bedrock (Mantle), or any
+OpenAI-compatible endpoint you name. Agents and providers are small registry entries; see
+[Adding a provider or agent](#adding-a-provider-or-agent) and
+[Deviations from upstream](#deviations-from-upstream).
 
 ## Prerequisites
 
@@ -14,8 +16,8 @@ OpenAI-compatible endpoints. See [Deviations from upstream](#deviations-from-ups
   tags to digests)
 - An E2B account with template builds and enough sandbox concurrency for your batch size
 - Access to the gated [dataset](https://huggingface.co/datasets/sunblaze-ucb/cybergym-e2e)
-- A `.env` (copy `.env.example`) with `E2B_API_KEY`, `HF_TOKEN`, and `AWS_MANTLE` or
-  `FIREWORKS_AI_API_KEY`
+- A `.env` (copy `.env.example`) with `E2B_API_KEY`, `HF_TOKEN`, and a model credential
+  (`AWS_MANTLE`, `FIREWORKS_AI_API_KEY`, or whatever `--model-key-env` names)
 
 ## Quickstart
 
@@ -28,6 +30,14 @@ uv run cybergym-e2b templates build-ffmpeg              # FFmpeg image + Opus mo
 uv run cybergym-e2b preflight --task curl/arvo_66012 --provider bedrock --model openai.gpt-5.4
 uv run cybergym-e2b smoke curl/arvo_66012               # infra only: ground-truth S4
 uv run cybergym-e2b run curl/arvo_66012 --agent codex --provider bedrock --model openai.gpt-5.4
+```
+
+Any OpenAI-compatible endpoint works without code changes; the credential still never enters the
+sandbox:
+
+```bash
+uv run cybergym-e2b run curl/arvo_66012 --agent codex --provider openai-compatible \
+  --model-base-url https://api.openai.com/v1 --model-key-env OPENAI_API_KEY --model gpt-5.4
 ```
 
 Batch (task file: one `project/task` per line; upstream `scripts/tasks.txt` lists all 920):
@@ -102,13 +112,32 @@ those sources for the agent; treat tasks where the agent needed one with care.
 and OSS-Fuzz builder images by digest, the Ubuntu archive at a dated snapshot, Docker package
 versions, and a hash-locked Python environment. Template tags are content-addressed
 (`cybergym-e2e-dind:recipe-<16 hex>`) and refused if their E2B build ID no longer matches the
-manifest. `--patch-file`, `--remote-smoke`, `--remote-install-codex`, and `--network-policy`
+manifest. `--patch-file`, `--remote-smoke`, `--bundle-script NAME=PATH`, and `--network-policy`
 override runtime assets and change the fingerprint.
+
+## Adding a provider or agent
+
+The adapter knows nothing about a specific model vendor or agent beyond two registries:
+
+- `src/cybergym_e2b/providers.py`: a `ModelProvider` maps `(wire API, region, base URL, key env)`
+  to an endpoint host and base URL and names the environment variables that may hold its key.
+  `openai-compatible` already covers any HTTPS endpoint via flags. To add a fixed provider, add a
+  `PROVIDERS` entry and put its host in `model_hosts` of both packaged policies (needed only for
+  allowlist modes).
+- `src/cybergym_e2b/agents.py`: an `AgentHarness` records the upstream `--agent` name, which wire
+  API it speaks (`responses` or `chat-completions`), whether it installs its own tooling inside
+  the task container, any scripts to ship in the bundle, how to rewrite the model ID for it, and
+  optionally how to read its trajectory to tell an interrupted turn from a graded failure.
+  Adding an agent that upstream already runs is one `AGENTS` entry. Adding one upstream does not
+  run means teaching `scripts/run_agent.py` first (via the compatibility patch or upstream), then
+  registering it.
+
+CLI choices, preflight output, network gating, bundle contents, and the experiment fingerprint all
+derive from these registries.
 
 ## Known limitations
 
 - No Claude Code / Anthropic path, so upstream's default configuration is not reproducible here.
-- No plain OpenAI provider.
 - The full image lock needs an authenticated Docker Hub session.
 - The 8 GB shape is validated on a sample of tasks, not all 920; check
   `observed_resources` in `result.json` for memory and swap pressure.

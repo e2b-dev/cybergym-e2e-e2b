@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import tomllib
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +18,6 @@ from cybergym_e2b.config import (
     DEFAULT_BUILD_IMAGE,
     DEFAULT_PATCH_FILE,
     DEFAULT_REMOTE_APT_RETRY,
-    DEFAULT_REMOTE_INSTALL_CODEX,
     DEFAULT_REMOTE_SMOKE,
     FFMPEG_IMAGE,
     FFMPEG_IMAGE_DIGEST,
@@ -158,10 +158,14 @@ def build_code_bundle(
     *,
     patch_file: Path = DEFAULT_PATCH_FILE,
     remote_smoke: Path = DEFAULT_REMOTE_SMOKE,
-    remote_install_codex: Path = DEFAULT_REMOTE_INSTALL_CODEX,
     remote_apt_retry: Path = DEFAULT_REMOTE_APT_RETRY,
+    scripts: Mapping[str, Path] | None = None,
 ) -> bytes:
-    """Pack upstream scripts plus one project/task; HF source blobs stay out of this bundle."""
+    """Pack upstream scripts plus one project/task; HF source blobs stay out of this bundle.
+
+    ``scripts`` are extra files written into ``scripts/`` (an agent's hardened installer, for
+    example), overriding upstream's copy of the same name.
+    """
     with tempfile.TemporaryDirectory(prefix="cybergym-e2b-bundle-") as temp_name:
         temp = Path(temp_name)
         shutil.copytree(upstream / "scripts", temp / "scripts")
@@ -173,8 +177,11 @@ def build_code_bundle(
             project_target / resolved.task_id,
         )
         shutil.copy2(remote_smoke, temp / "scripts" / "e2b_smoke.py")
-        shutil.copy2(remote_install_codex, temp / "scripts" / "install_codex.sh")
         shutil.copy2(remote_apt_retry, temp / "scripts" / "apt_retry.sh")
+        for name, source in (scripts or {}).items():
+            if "/" in name or name in {"", ".", ".."}:
+                raise ValueError(f"bundle script name must be a bare filename: {name!r}")
+            shutil.copy2(source, temp / "scripts" / name)
         subprocess.run(
             [
                 "git",

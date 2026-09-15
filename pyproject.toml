@@ -1,6 +1,6 @@
 [project]
 name = "cybergym-e2e-e2b"
-version = "0.3.0"
+version = "0.4.0"
 description = "Run CyberGym-E2E with one Docker-in-Docker E2B sandbox per task"
 readme = "README.md"
 license = "Apache-2.0"

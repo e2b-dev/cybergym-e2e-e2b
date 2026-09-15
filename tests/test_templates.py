@@ -224,7 +224,6 @@ def test_cli_defaults_resolve_packaged_runtime_assets_outside_checkout(
     assert args.network_policy.is_file()
     assert args.patch_file.is_file()
     assert args.remote_smoke.is_file()
-    assert args.remote_install_codex.is_file()
     assert Path("artifacts/templates/manifest.json") == DEFAULT_MANIFEST
 
 
