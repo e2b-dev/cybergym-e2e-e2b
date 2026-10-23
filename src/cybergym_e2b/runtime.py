@@ -5,13 +5,12 @@ import hashlib
 import ipaddress
 import json
 import os
-import re
 import shlex
 import socket
 import tarfile
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from functools import cache
@@ -21,6 +20,7 @@ from typing import Any, Literal
 import httpx
 from e2b import Sandbox
 
+from cybergym_e2b.agents import AGENTS, agent
 from cybergym_e2b.config import (
     DATASET_REPOSITORY,
     DATASET_REVISION,
@@ -30,7 +30,6 @@ from cybergym_e2b.config import (
     DEFAULT_NETWORK_POLICY,
     DEFAULT_PATCH_FILE,
     DEFAULT_REMOTE_APT_RETRY,
-    DEFAULT_REMOTE_INSTALL_CODEX,
     DEFAULT_REMOTE_SMOKE,
     FFMPEG_IMAGE,
     OPUS_MODEL_CACHE,
@@ -45,11 +44,10 @@ from cybergym_e2b.inventory import (
     build_code_bundle,
     require_immutable_runtime_image,
 )
+from cybergym_e2b.providers import EndpointRequest, provider
 from cybergym_e2b.templates import verify_template_ref
 
 EgressMode = Literal["policy", "restricted", "permissive"]
-Agent = Literal["codex", "openhands"]
-ModelProvider = Literal["fireworks", "bedrock"]
 ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 
 # Wall-clock kept back from the evaluation timeout so a workload that runs to the deadline
@@ -68,14 +66,16 @@ class RunOptions:
     swap_gb: int = 4
     egress: EgressMode = "policy"
     retain: bool = False
-    agent: Agent = "codex"
+    agent: str = "codex"  # key into agents.AGENTS
     prompt_style: str = "iterative"
     model: str = DEFAULT_MODEL
     reasoning_effort: ReasoningEffort = "high"
     max_attempts: int = 1
     agent_timeout: int = 5400
-    provider: ModelProvider = DEFAULT_MODEL_PROVIDER
-    bedrock_region: str = "us-west-2"
+    provider: str = DEFAULT_MODEL_PROVIDER  # key into providers.PROVIDERS
+    model_region: str = "us-west-2"
+    model_base_url: str | None = None  # openai-compatible provider only
+    model_key_env: str | None = None  # openai-compatible provider only
 
 
 @dataclass(frozen=True)
@@ -130,10 +130,6 @@ class _StageProfiler:
 
 def _secret(name: str, fallback: str | None = None) -> str | None:
     return os.environ.get(name) or (os.environ.get(fallback) if fallback else None)
-
-
-def _summary_wire_api(agent: str) -> str:
-    return "responses" if agent == "codex" else "chat-completions"
 
 
 def _policy(path: Path) -> dict[str, Any]:
@@ -205,38 +201,22 @@ def _resolve_non_http(policy: dict[str, Any], project: str) -> list[dict]:
 
 
 def _model_config(options: RunOptions) -> dict[str, str | None]:
-    if options.provider == "fireworks":
-        return {
-            "host": "api.fireworks.ai",
-            "base_url": "https://api.fireworks.ai/inference/v1",
-            "key": _secret("FIREWORKS_AI_API_KEY", "FIREWORKS_API_KEY"),
-            "key_name": "FIREWORKS_AI_API_KEY or FIREWORKS_API_KEY",
-        }
-    if options.provider == "bedrock":
-        if not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-\d", options.bedrock_region):
-            raise ValueError(f"invalid AWS Bedrock region: {options.bedrock_region!r}")
-        host = f"bedrock-mantle.{options.bedrock_region}.api.aws"
-        # Bedrock exposes OpenAI frontier models through its OpenAI-specific
-        # Responses route. Other Mantle models (including DeepSeek V3.2) use the
-        # general OpenAI-compatible route consumed by OpenHands via Chat Completions.
-        api_prefix = "openai/v1" if options.agent == "codex" else "v1"
-        return {
-            "host": host,
-            "base_url": f"https://{host}/{api_prefix}",
-            "key": _secret("AWS_MANTLE", "AWS_BEARER_TOKEN_BEDROCK"),
-            "key_name": "AWS_MANTLE or AWS_BEARER_TOKEN_BEDROCK",
-        }
-    raise ValueError(f"unsupported model provider: {options.provider!r}")
-
-
-def _agent_model_id(options: RunOptions) -> str:
-    # OpenHands delegates model dispatch to LiteLLM. Its `openai/` prefix selects
-    # the OpenAI-compatible transport and is removed before the request reaches
-    # the provider. Without it, a Bedrock catalog ID such as `deepseek.v3.2` is
-    # mistaken for LiteLLM's SigV4-native Bedrock transport.
-    if options.agent == "openhands" and not options.model.startswith("openai/"):
-        return f"openai/{options.model}"
-    return options.model
+    """Resolve the provider endpoint and credential for the selected agent's wire API."""
+    request = EndpointRequest(
+        wire_api=agent(options.agent).wire_api,
+        region=options.model_region,
+        base_url=options.model_base_url,
+        key_env=options.model_key_env,
+    )
+    selected = provider(options.provider)
+    endpoint = selected.endpoint(request)
+    key, key_name = selected.credential(request)
+    return {
+        "host": endpoint.host,
+        "base_url": endpoint.base_url,
+        "key": key,
+        "key_name": key_name,
+    }
 
 
 def _transforms(
@@ -295,16 +275,16 @@ def _network(
 
 
 def _require_runnable_policy(
-    policy: dict[str, Any], *, kind: Literal["smoke", "run"], egress: EgressMode
+    policy: dict[str, Any], *, kind: Literal["smoke", "run"], egress: EgressMode, agent_name: str
 ) -> None:
-    """Agent runs install Node and the agent CLI at runtime; a model-only allowlist cannot."""
+    """An agent that installs its tooling at runtime cannot run under a model-only allowlist."""
     if kind != "run" or not _enforces_allowlist(policy, egress):
         return
-    if not policy["runtime_dependency_hosts"]:
+    if agent(agent_name).installs_tooling_at_runtime and not policy["runtime_dependency_hosts"]:
         raise ValueError(
-            "network policy permits only the model host at runtime, but agent runs install "
-            "agent tooling (nvm, Node, Codex) inside the task container; preload that tooling "
-            "or use a policy that declares runtime_dependency_hosts"
+            f"network policy permits only the model host at runtime, but agent {agent_name!r} "
+            "installs its tooling inside the task container; preload that tooling or use a "
+            "policy that declares runtime_dependency_hosts"
         )
 
 
@@ -354,6 +334,17 @@ def _path_sha256(path_value: str) -> str | None:
     return digest.hexdigest()
 
 
+def _bundle_scripts(
+    kind: Literal["smoke", "run"],
+    options: RunOptions,
+    overrides: Mapping[str, Path] | None,
+) -> dict[str, Path]:
+    """Scripts shipped into the bundle's scripts/ directory: the agent's, then operator overrides."""
+    scripts = dict(agent(options.agent).bundle_scripts) if kind == "run" else {}
+    scripts.update(overrides or {})
+    return scripts
+
+
 def _experiment_identity(
     resolved: ResolvedTask,
     *,
@@ -364,12 +355,13 @@ def _experiment_identity(
     network_policy_path: Path,
     patch_file: Path = DEFAULT_PATCH_FILE,
     remote_smoke: Path = DEFAULT_REMOTE_SMOKE,
-    remote_install_codex: Path = DEFAULT_REMOTE_INSTALL_CODEX,
     remote_apt_retry: Path = DEFAULT_REMOTE_APT_RETRY,
+    bundle_script_overrides: Mapping[str, Path] | None = None,
     manifest: TemplateManifest | None = None,
 ) -> dict[str, Any]:
     """Build the complete, deterministic identity used for artifact reuse."""
     require_immutable_runtime_image(resolved)
+    scripts = _bundle_scripts(kind, options, bundle_script_overrides)
     manifest = manifest or TemplateManifest.load(manifest_path)
     template = _route_template(manifest, project=resolved.project, build_image=resolved.build_image)
     payload = {
@@ -395,8 +387,10 @@ def _experiment_identity(
             ),
             "compatibility_patch_sha256": _path_sha256(str(patch_file.resolve())),
             "remote_smoke_sha256": _path_sha256(str(remote_smoke.resolve())),
-            "remote_install_codex_sha256": _path_sha256(str(remote_install_codex.resolve())),
             "remote_apt_retry_sha256": _path_sha256(str(remote_apt_retry.resolve())),
+            "bundle_scripts_sha256": {
+                name: _path_sha256(str(path.resolve())) for name, path in sorted(scripts.items())
+            },
             "harness_sha256": _path_sha256(str(Path(__file__).resolve().parent)),
         },
     }
@@ -631,7 +625,7 @@ def _execution_context(
         build_image=resolved.build_image,
     )
     policy = _policy(network_policy_path)
-    _require_runnable_policy(policy, kind=kind, egress=options.egress)
+    _require_runnable_policy(policy, kind=kind, egress=options.egress, agent_name=options.agent)
     # Non-HTTP addresses only matter for an allowlist; skip host-side DNS otherwise.
     non_http = (
         _resolve_non_http(policy, resolved.project)
@@ -915,38 +909,6 @@ def _extract_results(archive_path: Path, root: Path) -> None:
         archive.extractall(root, filter=_result_member_filter)
 
 
-def _codex_turn_state(destination: Path) -> dict[str, Any]:
-    logs = sorted((destination / "sandbox" / "agent_output").glob("*/*/trajectory/*.log"))
-    completed_turns = 0
-    failed_turns = 0
-    last_error: str | None = None
-    for log in logs:
-        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "turn.completed":
-                completed_turns += 1
-            elif event.get("type") == "turn.failed":
-                failed_turns += 1
-                last_error = str((event.get("error") or {}).get("message") or "")
-    if completed_turns:
-        status = "completed"
-    elif failed_turns:
-        status = "failed"
-    else:
-        status = "missing"
-    result: dict[str, Any] = {
-        "status": status,
-        "completed_turns": completed_turns,
-        "failed_turns": failed_turns,
-    }
-    if last_error:
-        result["last_error"] = last_error
-    return result
-
-
 def _benchmark_result(destination: Path, kind: Literal["smoke", "run"]) -> dict:
     sandbox_results = destination / "sandbox"
     if kind == "smoke":
@@ -972,8 +934,9 @@ def _benchmark_result(destination: Path, kind: Literal["smoke", "run"]) -> dict:
         }
     summary = json.loads(summaries[0].read_text(encoding="utf-8"))
     upstream_status = summary.get("status")
-    if summary.get("agent") == "codex":
-        turn = _codex_turn_state(destination)
+    harness = AGENTS.get(str(summary.get("agent")))
+    if harness is not None and harness.turn_state is not None:
+        turn = harness.turn_state(destination)
         summary["agent_turn"] = turn
         # A validated S1-S3 success remains valid even if the provider connection
         # failed after producing the artifacts. A failed benchmark without a
@@ -982,7 +945,7 @@ def _benchmark_result(destination: Path, kind: Literal["smoke", "run"]) -> dict:
             return {
                 "status": "error",
                 "outcome": "incomplete_agent_turn",
-                "reason": "Codex did not complete a model turn",
+                "reason": f"{harness.name} did not complete a model turn",
                 "agent_turn": turn,
                 "upstream_summary": summary,
             }
@@ -1114,8 +1077,8 @@ def execute_task(
     network_policy_path: Path = DEFAULT_NETWORK_POLICY,
     patch_file: Path = DEFAULT_PATCH_FILE,
     remote_smoke: Path = DEFAULT_REMOTE_SMOKE,
-    remote_install_codex: Path = DEFAULT_REMOTE_INSTALL_CODEX,
     remote_apt_retry: Path = DEFAULT_REMOTE_APT_RETRY,
+    bundle_script_overrides: Mapping[str, Path] | None = None,
     batch_id: str | None = None,
     experiment: dict[str, Any] | None = None,
 ) -> dict:
@@ -1147,8 +1110,8 @@ def execute_task(
             resolved,
             patch_file=patch_file,
             remote_smoke=remote_smoke,
-            remote_install_codex=remote_install_codex,
             remote_apt_retry=remote_apt_retry,
+            scripts=_bundle_scripts(kind, options, bundle_script_overrides),
         )
     current_experiment = _experiment_identity(
         resolved,
@@ -1159,8 +1122,8 @@ def execute_task(
         network_policy_path=network_policy_path,
         patch_file=patch_file,
         remote_smoke=remote_smoke,
-        remote_install_codex=remote_install_codex,
         remote_apt_retry=remote_apt_retry,
+        bundle_script_overrides=bundle_script_overrides,
         manifest=manifest,
     )
     if experiment is not None and experiment.get("sha256") != current_experiment["sha256"]:
@@ -1300,10 +1263,11 @@ def execute_task(
                 f"scripts/e2b_smoke.py {shlex.quote(resolved.task)}"
             )
         else:
-            upstream_model = _agent_model_id(options)
+            harness = agent(options.agent)
+            upstream_model = harness.model_id(options.model)
             command = (
                 cache_env + "export E2B_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; "
-                f"export E2B_OPENAI_WIRE_API={_summary_wire_api(options.agent)}; "
+                f"export E2B_OPENAI_WIRE_API={harness.wire_api}; "
                 f"export OPENAI_BASE_URL={shlex.quote(str(model_config['base_url']))}; "
                 "export OPENAI_API_KEY=e2b-proxy-injected; "
                 f"cd {root} && /opt/cybergym-e2e-venv/bin/python scripts/run_agent.py "

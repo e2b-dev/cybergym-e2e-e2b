@@ -10,6 +10,7 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
+from cybergym_e2b.agents import AGENTS
 from cybergym_e2b.config import (
     DEFAULT_BUILD_LEDGER,
     DEFAULT_FFMPEG_TEMPLATE_NAME,
@@ -20,7 +21,6 @@ from cybergym_e2b.config import (
     DEFAULT_MODEL_PROVIDER,
     DEFAULT_NETWORK_POLICY,
     DEFAULT_PATCH_FILE,
-    DEFAULT_REMOTE_INSTALL_CODEX,
     DEFAULT_REMOTE_SMOKE,
     DEFAULT_TEMPLATE_NAME,
     DEFAULT_TEMPLATE_REQUIREMENTS,
@@ -38,9 +38,9 @@ from cybergym_e2b.inventory import (
     require_immutable_runtime_image,
     resolve_task,
 )
+from cybergym_e2b.providers import PROVIDERS, EndpointRequest
 from cybergym_e2b.runtime import (
     RunOptions,
-    _codex_turn_state,
     _execution_context,
     _experiment_identity,
     _network_eligibility,
@@ -72,7 +72,15 @@ def _run_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--patch-file", type=Path, default=DEFAULT_PATCH_FILE)
     parser.add_argument("--remote-smoke", type=Path, default=DEFAULT_REMOTE_SMOKE)
-    parser.add_argument("--remote-install-codex", type=Path, default=DEFAULT_REMOTE_INSTALL_CODEX)
+    parser.add_argument(
+        "--bundle-script",
+        dest="bundle_scripts",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="ship PATH as scripts/NAME in the code bundle, replacing the agent's or upstream's "
+        "copy; repeatable",
+    )
     parser.add_argument("--artifacts-dir", type=Path, default=Path("artifacts/e2e"))
     parser.add_argument("--setup-timeout", type=int, default=7200)
     parser.add_argument("--evaluation-timeout", type=int, default=28800)
@@ -97,24 +105,31 @@ def _run_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _agent_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--agent", choices=["codex", "openhands"], default="codex")
+    parser.add_argument("--agent", choices=sorted(AGENTS), default="codex")
     parser.add_argument("--prompt-style", choices=["iterative", "no-test"], default="iterative")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--reasoning-effort",
         choices=["low", "medium", "high", "xhigh"],
         default="high",
-        help="explicit Codex reasoning effort; high matches this security workload",
+        help="reasoning effort passed to upstream; high matches this security workload",
     )
     parser.add_argument("--max-attempts", type=int, default=1)
     parser.add_argument("--agent-timeout", type=int, default=5400)
     parser.add_argument(
         "--provider",
-        choices=["fireworks", "bedrock"],
+        choices=sorted(PROVIDERS),
         default=DEFAULT_MODEL_PROVIDER,
-        help="model API provider; Bedrock uses its OpenAI-compatible Mantle endpoint",
+        help="model API provider; 'openai-compatible' takes --model-base-url and --model-key-env",
     )
-    parser.add_argument("--bedrock-region", default="us-west-2")
+    parser.add_argument("--model-region", default="us-west-2", help="cloud region (bedrock)")
+    parser.add_argument(
+        "--model-base-url", help="OpenAI-compatible base URL (provider openai-compatible)"
+    )
+    parser.add_argument(
+        "--model-key-env",
+        help="environment variable holding the credential (provider openai-compatible)",
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -242,13 +257,26 @@ def _sync(path: Path) -> dict:
     return {"repository": UPSTREAM_REPOSITORY, "commit": _verify_upstream(path), "path": str(path)}
 
 
+def _bundle_script_overrides(args: argparse.Namespace) -> dict[str, Path]:
+    overrides: dict[str, Path] = {}
+    for item in getattr(args, "bundle_scripts", []):
+        name, separator, path = item.partition("=")
+        if not separator or not name or not path:
+            raise ValueError(f"--bundle-script expects NAME=PATH, got {item!r}")
+        overrides[name] = Path(path)
+    return overrides
+
+
 def _require_asset_files(args: argparse.Namespace) -> None:
     """Fail fast on a mistyped runtime asset override instead of once per task."""
-    for field in ("network_policy", "patch_file", "remote_smoke", "remote_install_codex"):
+    for field in ("network_policy", "patch_file", "remote_smoke"):
         path = getattr(args, field, None)
         if path is not None and not Path(path).is_file():
             flag = "--" + field.replace("_", "-")
             raise FileNotFoundError(f"{flag} is not a file: {path}")
+    for name, path in _bundle_script_overrides(args).items():
+        if not path.is_file():
+            raise FileNotFoundError(f"--bundle-script {name} is not a file: {path}")
 
 
 def _options(args: argparse.Namespace) -> RunOptions:
@@ -272,7 +300,9 @@ def _options(args: argparse.Namespace) -> RunOptions:
             "max_attempts",
             "agent_timeout",
             "provider",
-            "bedrock_region",
+            "model_region",
+            "model_base_url",
+            "model_key_env",
         )
         if hasattr(args, field)
     }
@@ -302,7 +332,7 @@ def _execute(
         network_policy_path=args.network_policy,
         patch_file=args.patch_file,
         remote_smoke=args.remote_smoke,
-        remote_install_codex=args.remote_install_codex,
+        bundle_script_overrides=_bundle_script_overrides(args),
         batch_id=batch_id,
         experiment=experiment,
     )
@@ -338,8 +368,13 @@ def _already_completed(artifacts_dir: Path, task: str, experiment_sha256: str) -
         benchmark = result.get("benchmark") or {}
         if benchmark.get("status") not in {"passed", "failed"}:
             continue
-        if benchmark.get("status") == "failed" and benchmark.get("agent") == "codex":
-            turn = benchmark.get("agent_turn") or _codex_turn_state(result_path.parent)
+        harness = AGENTS.get(str(benchmark.get("agent")))
+        if (
+            benchmark.get("status") == "failed"
+            and harness is not None
+            and harness.turn_state is not None
+        ):
+            turn = benchmark.get("agent_turn") or harness.turn_state(result_path.parent)
             if turn.get("status") != "completed":
                 continue
         smoke_stages = benchmark.get("stages") or {}
@@ -353,7 +388,12 @@ def _batch(args: argparse.Namespace) -> dict:
         raise ValueError("concurrency must be between 1 and 180")
     options = _options(args)
     # Reject an unrunnable policy once, before any task is resolved or submitted.
-    _require_runnable_policy(_policy(args.network_policy), kind=args.kind, egress=options.egress)
+    _require_runnable_policy(
+        _policy(args.network_policy),
+        kind=args.kind,
+        egress=options.egress,
+        agent_name=options.agent,
+    )
     requested = _tasks(args)
     image_map = load_image_map(args.image_lock, upstream=args.upstream)
     manifest = TemplateManifest.load(args.manifest)
@@ -370,7 +410,7 @@ def _batch(args: argparse.Namespace) -> dict:
             network_policy_path=args.network_policy,
             patch_file=args.patch_file,
             remote_smoke=args.remote_smoke,
-            remote_install_codex=args.remote_install_codex,
+            bundle_script_overrides=_bundle_script_overrides(args),
             manifest=manifest,
         )
         if args.reuse_completed and _already_completed(
@@ -578,12 +618,20 @@ def main(argv: list[str] | None = None) -> int:
                     "present": model_key_present,
                     "required": args.kind == "run",
                 },
-                "fireworks_key_present": bool(
-                    os.environ.get("FIREWORKS_AI_API_KEY") or os.environ.get("FIREWORKS_API_KEY")
-                ),
-                "bedrock_key_present": bool(
-                    os.environ.get("AWS_MANTLE") or os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
-                ),
+                "provider_keys_present": {
+                    name: bool(
+                        PROVIDERS[name].credential(
+                            EndpointRequest(
+                                wire_api="responses",
+                                region=options.model_region,
+                                base_url=options.model_base_url,
+                                key_env=options.model_key_env,
+                            )
+                        )[0]
+                    )
+                    for name in sorted(PROVIDERS)
+                    if PROVIDERS[name].key_env or options.model_key_env
+                },
                 "hugging_face": hf,
             }
         elif args.command in {"smoke", "run", "batch"}:
